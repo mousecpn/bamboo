@@ -185,29 +185,33 @@ TEST(Guide, JointLimitZonePushesAwayAndIsContinuous) {
   Vec7 q = Home();
   EXPECT_DOUBLE_EQ(JointLimitTorque(q, Vec7::Zero(), kLower, kUpper,
                                     p.limit_zone, p.limit_torque,
-                                    p.limit_damping)
+                                    p.limit_damping, p.limit_wall_margin,
+                                    p.hold_kp, p.hold_kd)
                        .norm(),
                    0.0);
   // At the zone edge of joint 4's upper limit the spring is still zero.
   q[3] = kUpper[3] - p.limit_zone[3];
   EXPECT_NEAR(JointLimitTorque(q, Vec7::Zero(), kLower, kUpper, p.limit_zone,
-                               p.limit_torque, p.limit_damping)[3],
+                               p.limit_torque, p.limit_damping,
+                               p.limit_wall_margin, p.hold_kp, p.hold_kd)[3],
               0.0, 1e-9);
   // Halfway in, it pushes back toward the lower side with half the torque.
   q[3] = kUpper[3] - 0.5 * p.limit_zone[3];
-  const Vec7 tau =
-      JointLimitTorque(q, Vec7::Zero(), kLower, kUpper, p.limit_zone,
-                       p.limit_torque, p.limit_damping);
+  const Vec7 tau = JointLimitTorque(
+      q, Vec7::Zero(), kLower, kUpper, p.limit_zone, p.limit_torque,
+      p.limit_damping, p.limit_wall_margin, p.hold_kp, p.hold_kd);
   EXPECT_NEAR(tau[3], -0.5 * p.limit_torque[3], 1e-9);
   // Moving away from the limit is not damped; moving toward it is.
   Vec7 away = Vec7::Zero(), toward = Vec7::Zero();
   away[3] = -0.2;
   toward[3] = 0.2;
   EXPECT_NEAR(JointLimitTorque(q, away, kLower, kUpper, p.limit_zone,
-                               p.limit_torque, p.limit_damping)[3],
+                               p.limit_torque, p.limit_damping,
+                               p.limit_wall_margin, p.hold_kp, p.hold_kd)[3],
               tau[3], 1e-12);
   EXPECT_LT(JointLimitTorque(q, toward, kLower, kUpper, p.limit_zone,
-                             p.limit_torque, p.limit_damping)[3],
+                             p.limit_torque, p.limit_damping,
+                             p.limit_wall_margin, p.hold_kp, p.hold_kd)[3],
             tau[3]);
 }
 
@@ -330,24 +334,47 @@ TEST(Guide, GelLevelAndValidityTriggerHolds) {
   }
 }
 
-TEST(Guide, JointLimitHoldNeedsDistanceToResume) {
+TEST(Guide, JointLimitWallStopsAPushShortOfTheLimitWithoutHolding) {
   const GuideParams p;
-  GuideState s;
   Vec7 q = Home();
-  q[3] = kUpper[3] - 0.04; // inside the 0.05 rad hold margin
-  GuideInputs in = FreeInputs(q, Vec7::Zero());
-  for (int tick = 0; tick < 800; ++tick) {
-    GuideStep(p, in, &s);
+  q[3] = kUpper[3] - 0.3;
+  Vec7 dq = Vec7::Zero();
+  Vec7 push = Vec7::Zero();
+  push[3] = 10.0; // an operator keeps pushing joint 4 toward its upper limit
+  GuideState s;
+  double closest = 1.0;
+  for (int tick = 0; tick < 3000; ++tick) {
+    const GuideInputs in = FreeInputs(q, dq);
+    const Vec7 tau = GuideStep(p, in, &s);
+    EXPECT_TRUE(s.reason == HoldReason::kNone || s.reason == HoldReason::kIdle);
+    dq += (tau + push).cwiseQuotient(kInertia) * in.dt;
+    q += dq * in.dt;
+    closest = std::min(closest, kUpper[3] - q[3]);
   }
-  ASSERT_EQ(s.phase, GuidePhase::kHold);
-  EXPECT_EQ(s.reason, HoldReason::kJointLimit);
-  in.resume_requested = true;
-  in.q[3] = kUpper[3] - 0.08; // out of the hold margin, inside resume margin
-  GuideStep(p, in, &s);
-  EXPECT_EQ(s.phase, GuidePhase::kHold);
-  in.q[3] = kUpper[3] - 0.2;
-  GuideStep(p, in, &s);
-  EXPECT_EQ(s.phase, GuidePhase::kRelease);
+  EXPECT_GT(closest, 0.02); // never reaches Franka's hard limit
+
+  // Pulling the other way frees it: nothing needs a resume.
+  push[3] = -10.0;
+  for (int tick = 0; tick < 1500; ++tick) {
+    const GuideInputs in = FreeInputs(q, dq);
+    const Vec7 tau = GuideStep(p, in, &s);
+    dq += (tau + push).cwiseQuotient(kInertia) * in.dt;
+    q += dq * in.dt;
+  }
+  EXPECT_GT(kUpper[3] - q[3], p.limit_wall_margin);
+}
+
+TEST(Guide, JointLimitWallIsContinuousAtItsMargin) {
+  const GuideParams p;
+  Vec7 outside = Home(), inside = Home();
+  outside[3] = kUpper[3] - p.limit_wall_margin - 1e-9;
+  inside[3] = kUpper[3] - p.limit_wall_margin + 1e-9;
+  const auto torque = [&](const Vec7 &q) {
+    return JointLimitTorque(q, Vec7::Zero(), kLower, kUpper, p.limit_zone,
+                            p.limit_torque, p.limit_damping,
+                            p.limit_wall_margin, p.hold_kp, p.hold_kd)[3];
+  };
+  EXPECT_NEAR(torque(outside), torque(inside), 1e-6);
 }
 
 TEST(Guide, StopOverridesResume) {

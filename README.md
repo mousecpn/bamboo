@@ -188,13 +188,14 @@ What the arm does:
 
 - **Free:** light joint damping and a small, smooth friction. Joints resist
   above `max_joint_velocity` (and within half of Franka's position-dependent
-  velocity limits) and are pushed back softly near their position limits.
+  velocity limits). Near a position limit a joint is pushed back softly, and
+  within 0.05 rad by a stiff one-way wall that keeps it off Franka's hard
+  limit; moving away is never blocked, so this needs no resume.
 - **Idle hold:** left still for `idle_hold_s` (default 1 s), the arm holds its
   pose, and breaks free again when pushed. Set it to 0 to turn this off.
-- **Safety holds:** stale updates, `update_guiding(valid=False)`, a wall
-  `level` of 1, or a joint within 0.05 rad of its limit make the arm damp to a
-  stop and hold until `resume_guiding()`, which the controller only honours
-  once the cause has cleared.
+- **Safety holds:** stale updates, `update_guiding(valid=False)` or a wall
+  `level` of 1 make the arm damp to a stop and hold until `resume_guiding()`,
+  which the controller only honours once the cause has cleared.
 - **Wall:** `update_guiding(level, direction=...)` adds a one-way damper that
   resists motion along `direction` (end-effector frame) at
   `level * wall_damping` N s/m, while motion back the other way stays free.

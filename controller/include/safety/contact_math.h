@@ -83,12 +83,18 @@ inline Vec7 GovernorTorque(const Vec7 &dq, const Vec7 &v_lo, const Vec7 &v_hi,
   return tau;
 }
 
-// Soft joint-limit zones. Within `zone` of a limit the joint is pushed away by
-// a spring that ramps from zero at the zone edge to `edge_torque` at the
-// limit, plus damping on motion toward the limit that scales the same way.
+// Joint limits, in two layers. Within `zone` of a limit the joint is pushed
+// away by a spring that ramps from zero at the zone edge to `edge_torque` at
+// the limit, with damping on motion toward the limit that scales the same way.
+// Within `wall_margin` a stiff one-way wall (`wall_stiffness`, damped both
+// ways) adds to it and keeps the joint off Franka's hard limit, which would be
+// a reflex error. Moving away from the limit stays free, so reaching it never
+// needs a resume.
 inline Vec7 JointLimitTorque(const Vec7 &q, const Vec7 &dq, const Vec7 &lower,
                              const Vec7 &upper, const Vec7 &zone,
-                             const Vec7 &edge_torque, const Vec7 &damping) {
+                             const Vec7 &edge_torque, const Vec7 &damping,
+                             double wall_margin, const Vec7 &wall_stiffness,
+                             const Vec7 &wall_damping) {
   Vec7 tau = Vec7::Zero();
   for (int i = 0; i < 7; ++i) {
     if (zone[i] <= 0.0) {
@@ -102,6 +108,10 @@ inline Vec7 JointLimitTorque(const Vec7 &q, const Vec7 &dq, const Vec7 &lower,
         tau[i] -= damping[i] * depth * dq[i];
       }
     }
+    if (to_lower < wall_margin) {
+      tau[i] += wall_stiffness[i] * (wall_margin - to_lower) -
+                wall_damping[i] * dq[i];
+    }
     const double to_upper = upper[i] - q[i];
     if (to_upper < zone[i]) {
       const double depth = std::clamp((zone[i] - to_upper) / zone[i], 0.0, 1.0);
@@ -110,18 +120,12 @@ inline Vec7 JointLimitTorque(const Vec7 &q, const Vec7 &dq, const Vec7 &lower,
         tau[i] -= damping[i] * depth * dq[i];
       }
     }
-  }
-  return tau;
-}
-
-inline bool WithinMarginOfLimit(const Vec7 &q, const Vec7 &lower,
-                                const Vec7 &upper, double margin) {
-  for (int i = 0; i < 7; ++i) {
-    if (q[i] - lower[i] < margin || upper[i] - q[i] < margin) {
-      return true;
+    if (to_upper < wall_margin) {
+      tau[i] -= wall_stiffness[i] * (wall_margin - to_upper) +
+                wall_damping[i] * dq[i];
     }
   }
-  return false;
+  return tau;
 }
 
 // One-way damper "wall". With a direction n (unit, base frame) it resists only
@@ -164,7 +168,7 @@ enum class HoldReason : int {
   kWatchdog = 1,   // guide updates stopped arriving
   kGelInvalid = 2, // the client says its gel signal is not trustworthy
   kGelLimit = 3,   // gel load reached the client's limit
-  kJointLimit = 4, // a joint came within the hold margin of its limit
+  kJointLimit = 4, // reserved: joint limits use a one-way wall, not a hold
   kStopping = 5,   // stop_guide
   kIdle = 6,       // the arm was left still; breaks free when pushed
 };
@@ -193,8 +197,8 @@ struct GuideParams {
       (Vec7() << 12.0, 12.0, 12.0, 12.0, 4.0, 4.0, 4.0).finished();
   Vec7 limit_damping =
       (Vec7() << 10.0, 10.0, 10.0, 10.0, 5.0, 5.0, 3.0).finished();
-  double hold_margin = 0.05;   // rad from a hard limit
-  double resume_margin = 0.10; // must be this far out to resume
+  double limit_wall_margin = 0.05; // rad from a hard limit; the wall uses
+                                   // hold_kp and hold_kd
   Vec7 hold_kp = (Vec7() << 437.5, 525.0, 525.0, 437.5, 87.5, 175.0, 43.75)
                      .finished(); // half of Bamboo's default stiffness
   Vec7 hold_kd = (Vec7() << 37.5, 50.0, 37.5, 25.0, 5.0, 3.75, 2.5).finished();
@@ -250,13 +254,14 @@ inline Vec7 FreeTorque(const GuideParams &p, const GuideInputs &in,
          GovernorTorque(in.dq, in.velocity_low, in.velocity_high,
                         p.governor_damping) +
          JointLimitTorque(in.q, in.dq, in.lower, in.upper, p.limit_zone,
-                          p.limit_torque, p.limit_damping) +
+                          p.limit_torque, p.limit_damping, p.limit_wall_margin,
+                          p.hold_kp, p.hold_kd) +
          DamperWallTorque(in.J_lin, in.J_ang, in.dq, level, in.has_direction,
                           in.direction, p.wall_damping,
                           p.wall_rotational_damping);
 }
 
-inline HoldReason HoldTrigger(const GuideParams &p, const GuideInputs &in) {
+inline HoldReason HoldTrigger(const GuideInputs &in) {
   if (in.stop_requested) {
     return HoldReason::kStopping;
   }
@@ -269,16 +274,12 @@ inline HoldReason HoldTrigger(const GuideParams &p, const GuideInputs &in) {
   if (in.level >= 1.0) {
     return HoldReason::kGelLimit;
   }
-  if (WithinMarginOfLimit(in.q, in.lower, in.upper, p.hold_margin)) {
-    return HoldReason::kJointLimit;
-  }
   return HoldReason::kNone;
 }
 
-inline bool ResumeAllowed(const GuideParams &p, const GuideInputs &in) {
+inline bool ResumeAllowed(const GuideInputs &in) {
   return !in.stop_requested && in.update_fresh && in.level_valid &&
-         std::isfinite(in.level) && in.level < 0.5 &&
-         !WithinMarginOfLimit(in.q, in.lower, in.upper, p.resume_margin);
+         std::isfinite(in.level) && in.level < 0.5;
 }
 
 // One 1 kHz step of the hand-guiding controller. Returns joint torques
@@ -294,7 +295,7 @@ inline Vec7 GuideStep(const GuideParams &p, const GuideInputs &in,
   s->level += alpha * (target_level - s->level);
   s->phase_time += dt;
 
-  const HoldReason trigger = HoldTrigger(p, in);
+  const HoldReason trigger = HoldTrigger(in);
   const bool holding = s->phase == GuidePhase::kHoldDamp ||
                        s->phase == GuidePhase::kHoldRamp ||
                        s->phase == GuidePhase::kHold;
@@ -324,15 +325,15 @@ inline Vec7 GuideStep(const GuideParams &p, const GuideInputs &in,
     s->reason = HoldReason::kNone;
     s->phase_time = 0.0;
   } else if (s->phase == GuidePhase::kHold && in.resume_requested &&
-             ResumeAllowed(p, in)) {
+             ResumeAllowed(in)) {
     s->phase = GuidePhase::kRelease;
     s->reason = HoldReason::kNone;
     s->phase_time = 0.0;
   }
 
-  const Vec7 limits =
-      JointLimitTorque(in.q, in.dq, in.lower, in.upper, p.limit_zone,
-                       p.limit_torque, p.limit_damping);
+  const Vec7 limits = JointLimitTorque(
+      in.q, in.dq, in.lower, in.upper, p.limit_zone, p.limit_torque,
+      p.limit_damping, p.limit_wall_margin, p.hold_kp, p.hold_kd);
   switch (s->phase) {
   case GuidePhase::kFree:
     return FreeTorque(p, in, s->level);

@@ -94,6 +94,36 @@ int64_t steadyNowNanoseconds() {
       .count();
 }
 
+// Why Franka would refuse to start guiding in this mode, or empty when it can.
+// Franka accepts a motion only while idle; libfranka's own rejection names the
+// mode but not what the operator has to do about it.
+std::string GuideStartProblem(franka::RobotMode mode) {
+  switch (mode) {
+  case franka::RobotMode::kIdle:
+    return "";
+  case franka::RobotMode::kUserStopped:
+    return "Franka is user-stopped (robot mode \"User stopped\"): the user "
+           "stop button is pressed. Release it so the lights turn blue, as "
+           "for teleoperation, then start guiding again";
+  case franka::RobotMode::kGuiding:
+    return "Franka's Pilot guiding buttons are held. Let go of them, then "
+           "start guiding again";
+  case franka::RobotMode::kReflex:
+    return "Franka is still in a reflex after error recovery. Check Desk for "
+           "the error, then start guiding again";
+  case franka::RobotMode::kAutomaticErrorRecovery:
+    return "Franka is recovering from an error. Wait for it to finish, then "
+           "start guiding again";
+  case franka::RobotMode::kMove:
+    return "Franka is already executing a motion. Stop it, then start "
+           "guiding again";
+  case franka::RobotMode::kOther:
+    break;
+  }
+  return "Franka is not ready to move (robot mode \"Other\"). In Desk, "
+         "unlock the joints and activate FCI, then start guiding again";
+}
+
 } // namespace
 
 // Signal handler for graceful shutdown
@@ -478,8 +508,18 @@ public:
       std::lock_guard<std::mutex> lock(guide_error_mutex_);
       guide_error_message_.clear();
     }
-    const franka::RobotState start_state = robot_->readOnce();
+    franka::RobotState start_state = robot_->readOnce();
+    if (start_state.robot_mode == franka::RobotMode::kReflex) {
+      std::cout << "[GUIDE] Clearing a Franka reflex before guiding"
+                << std::endl;
+      robot_->automaticErrorRecovery();
+      start_state = robot_->readOnce();
+    }
     cacheRobotState(start_state);
+    const std::string mode_problem = GuideStartProblem(start_state.robot_mode);
+    if (!mode_problem.empty()) {
+      throw std::runtime_error(mode_problem);
+    }
     if (bamboo::safety::WrenchEstimateValid(start_state.O_F_ext_hat_K)) {
       const double force = Eigen::Vector3d(start_state.O_F_ext_hat_K[0],
                                            start_state.O_F_ext_hat_K[1],
@@ -897,11 +937,16 @@ private:
         lower[i] = joint_lower_[i];
         upper[i] = joint_upper_[i];
       }
-      guide_ready_.store(true);
+      bool started = false;
 
       auto control_callback = [&](const franka::RobotState &robot_state,
                                   franka::Duration period) -> franka::Torques {
         cacheRobotState(robot_state);
+        if (!started) {
+          // Franka has accepted the motion: StartGuide may report success.
+          started = true;
+          guide_ready_.store(true);
+        }
         bamboo::safety::GuideInputs in;
         in.q = Eigen::Map<const Vector7d>(robot_state.q.data());
         in.dq = Eigen::Map<const Vector7d>(robot_state.dq.data());

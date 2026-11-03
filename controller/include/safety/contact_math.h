@@ -12,6 +12,7 @@
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <limits>
 
 namespace bamboo {
 namespace safety {
@@ -155,6 +156,66 @@ inline Vec7 DamperWallTorque(const Mat37 &J_lin, const Mat37 &J_ang,
   return J_lin.transpose() * force + J_ang.transpose() * moment;
 }
 
+// Speed leash. Each joint has a shadow that follows it but may move only
+// within the speed band [v_lo, v_hi]. While the arm stays inside the band the
+// shadow sits on it and the leash is slack. Faster, the arm gets ahead of its
+// shadow and a spring (kp) pulls it back, with damping (kd) that fades in over
+// the first `blend` rad of lead, so the leash takes up and lets go without a
+// torque step. The spring stops growing at `max_torque`: pushing harder than
+// that drags the shadow along. The shadow only ever moves toward the arm,
+// which removes spring energy and never adds any, so the leash is passive.
+// Returns the torque; updates *q_shadow and the largest lead in *max_lead_out.
+inline Vec7 LeashTorque(const Vec7 &q, const Vec7 &dq, const Vec7 &v_lo,
+                        const Vec7 &v_hi, double dt, const Vec7 &kp,
+                        const Vec7 &kd, const Vec7 &max_torque, double blend,
+                        Vec7 *q_shadow, double *max_lead_out) {
+  Vec7 tau = Vec7::Zero();
+  double max_lead = 0.0;
+  for (int i = 0; i < 7; ++i) {
+    double &shadow = (*q_shadow)[i];
+    shadow += std::clamp(q[i] - shadow, std::min(v_lo[i], 0.0) * dt,
+                         std::max(v_hi[i], 0.0) * dt);
+    double lead = q[i] - shadow;
+    const double lead_limit = kp[i] > 0.0 ? max_torque[i] / kp[i] : 0.0;
+    if (std::abs(lead) > lead_limit) {
+      lead = std::copysign(lead_limit, lead);
+      shadow = q[i] - lead;
+    }
+    const double weight =
+        blend > 0.0 ? std::min(1.0, std::abs(lead) / blend) : 1.0;
+    tau[i] = -kp[i] * lead - weight * kd[i] * dq[i];
+    max_lead = std::max(max_lead, std::abs(lead));
+  }
+  if (max_lead_out != nullptr) {
+    *max_lead_out = max_lead;
+  }
+  return tau;
+}
+
+// One-way wall in Cartesian space ("ratchet"): the contact point p may not
+// advance along n (unit, base frame) past `anchor`, but backing off is free and
+// drags the anchor along, so the wall always sits where the point last was.
+// Inside the wall a spring and damper push back (never pull); at the wall only
+// advancing motion is damped. The anchor moves only while the spring is
+// unloaded, so it never releases stored energy into the arm.
+inline Vec7 RatchetTorque(const Mat37 &J_lin, const Vec7 &dq, const Vec3 &p,
+                          const Vec3 &n, double stiffness, double damping,
+                          Vec3 *anchor, double *depth_out) {
+  double depth = n.dot(p - *anchor);
+  if (depth < 0.0) {
+    *anchor += depth * n;
+    depth = 0.0;
+  }
+  if (depth_out != nullptr) {
+    *depth_out = depth;
+  }
+  const double speed = n.dot(J_lin * dq);
+  const double force = depth > 0.0
+                           ? std::max(0.0, stiffness * depth + damping * speed)
+                           : damping * std::max(0.0, speed);
+  return -(J_lin.transpose() * (force * n));
+}
+
 enum class GuidePhase : int {
   kFree = 0,
   kHoldDamp = 1, // damp to a stop before latching, so the hold never springs
@@ -211,6 +272,20 @@ struct GuideParams {
   double level_time_constant = 0.03;    // s, smooths the ~19 Hz gel level
   double wall_damping = 100.0;          // N s/m at level 1
   double wall_rotational_damping = 2.0; // N m s/rad at level 1
+  // Speed leash: Bamboo's streaming stiffness, so a hand cannot get the arm
+  // ahead of what streaming could replay by more than max_torque / kp.
+  Vec7 leash_kp =
+      (Vec7() << 875.0, 1050.0, 1050.0, 875.0, 175.0, 350.0, 87.5).finished();
+  Vec7 leash_kd = (Vec7() << 37.5, 50.0, 37.5, 25.0, 5.0, 3.75, 2.5).finished();
+  Vec7 leash_max_torque =
+      (Vec7() << 40.0, 40.0, 40.0, 40.0, 20.0, 10.0, 10.0).finished();
+  double leash_blend = 0.005; // rad of lead over which leash damping fades in
+  // Gel ratchet: from ratchet_engage_level (with a load direction) the contact
+  // point cannot advance further along it; it lets go below the release level.
+  double ratchet_stiffness = 3000.0; // N/m
+  double ratchet_damping = 120.0;    // N s/m
+  double ratchet_engage_level = 1.0;
+  double ratchet_release_level = 0.6;
 };
 
 struct GuideInputs {
@@ -222,6 +297,7 @@ struct GuideInputs {
   Vec7 velocity_high = Vec7::Zero(); // Franka's position-dependent limits
   Mat37 J_lin = Mat37::Zero();       // contact point, base frame
   Mat37 J_ang = Mat37::Zero();
+  Vec3 contact_position = Vec3::Zero(); // contact point, base frame
   double dt = 0.001;
   bool update_fresh = true;
   bool level_valid = true;
@@ -239,6 +315,15 @@ struct GuideState {
   double idle_time = 0.0;
   double level = 0.0; // filtered
   Vec7 q_hold = Vec7::Zero();
+  // Speed leash; re-seeded on the arm whenever it is not floating.
+  Vec7 q_shadow = Vec7::Zero();
+  bool shadow_valid = false;
+  double lead = 0.0; // largest |q - q_shadow|, rad
+  // Gel ratchet; kept through holds so a hold cannot reset it deeper.
+  bool ratchet_engaged = false;
+  Vec3 ratchet_anchor = Vec3::Zero();
+  Vec3 ratchet_direction = Vec3::Zero();
+  double ratchet_depth = 0.0; // m past the anchor
 };
 
 inline Vec7 HoldTorque(const GuideParams &p, const Vec7 &q, const Vec7 &dq,
@@ -271,7 +356,9 @@ inline HoldReason HoldTrigger(const GuideInputs &in) {
   if (!in.level_valid || !std::isfinite(in.level)) {
     return HoldReason::kGelInvalid;
   }
-  if (in.level >= 1.0) {
+  // With a load direction the ratchet stops further loading and still lets
+  // the arm back off; a hold would freeze the load in place instead.
+  if (in.level >= 1.0 && !in.has_direction) {
     return HoldReason::kGelLimit;
   }
   return HoldReason::kNone;
@@ -279,8 +366,48 @@ inline HoldReason HoldTrigger(const GuideInputs &in) {
 
 inline bool ResumeAllowed(const GuideInputs &in) {
   return !in.stop_requested && in.update_fresh && in.level_valid &&
-         std::isfinite(in.level) && in.level < 0.5;
+         std::isfinite(in.level) && (in.has_direction || in.level < 0.5);
 }
+
+// Engages, keeps or releases the gel ratchet and returns its torque.
+inline Vec7 GelRatchetStep(const GuideParams &p, const GuideInputs &in,
+                           GuideState *s) {
+  const bool directed =
+      in.has_direction && in.direction.allFinite() && in.direction.norm() > 0.5;
+  const double level = std::isfinite(in.level) ? in.level : 0.0;
+  if (!directed || !in.level_valid || level < p.ratchet_release_level) {
+    s->ratchet_engaged = false;
+  } else if (!s->ratchet_engaged && level >= p.ratchet_engage_level) {
+    s->ratchet_engaged = true;
+    s->ratchet_direction = in.direction.normalized();
+    s->ratchet_anchor = in.contact_position;
+  }
+  if (!s->ratchet_engaged) {
+    s->ratchet_depth = 0.0;
+    return Vec7::Zero();
+  }
+  return RatchetTorque(in.J_lin, in.dq, in.contact_position,
+                       s->ratchet_direction, p.ratchet_stiffness,
+                       p.ratchet_damping, &s->ratchet_anchor,
+                       &s->ratchet_depth);
+}
+
+// Free-mode torque with the stateful parts: the speed leash on top of
+// FreeTorque. Seeds the shadow on the arm the first time.
+inline Vec7 FreeStep(const GuideParams &p, const GuideInputs &in, GuideState *s,
+                     double dt) {
+  if (!s->shadow_valid) {
+    s->q_shadow = in.q;
+    s->shadow_valid = true;
+  }
+  return FreeTorque(p, in, s->level) +
+         LeashTorque(in.q, in.dq, in.velocity_low, in.velocity_high, dt,
+                     p.leash_kp, p.leash_kd, p.leash_max_torque, p.leash_blend,
+                     &s->q_shadow, &s->lead);
+}
+
+inline Vec7 PhaseTorque(const GuideParams &p, const GuideInputs &in,
+                        GuideState *s, double dt);
 
 // One 1 kHz step of the hand-guiding controller. Returns joint torques
 // (gravity is compensated by Franka; no Coriolis term, so free mode stays
@@ -301,8 +428,11 @@ inline Vec7 GuideStep(const GuideParams &p, const GuideInputs &in,
                        s->phase == GuidePhase::kHold;
   const bool idle_hold = holding && s->reason == HoldReason::kIdle;
   const bool still = in.dq.cwiseAbs().maxCoeff() < p.idle_velocity;
-  s->idle_time =
-      (s->phase == GuidePhase::kFree && still) ? s->idle_time + dt : 0.0;
+  // Held still by the ratchet is not "left still": no idle hold, which would
+  // otherwise cycle with the breakaway while someone pushes on the wall.
+  s->idle_time = (s->phase == GuidePhase::kFree && still && !s->ratchet_engaged)
+                     ? s->idle_time + dt
+                     : 0.0;
   if (!holding && trigger != HoldReason::kNone) {
     s->phase = GuidePhase::kHoldDamp;
     s->reason = trigger;
@@ -331,12 +461,25 @@ inline Vec7 GuideStep(const GuideParams &p, const GuideInputs &in,
     s->phase_time = 0.0;
   }
 
+  const Vec7 ratchet = GelRatchetStep(p, in, s);
+  const bool floating =
+      s->phase == GuidePhase::kFree || s->phase == GuidePhase::kRelease;
+  if (!floating) {
+    s->shadow_valid = false;
+    s->lead = 0.0;
+  }
+  return ratchet + PhaseTorque(p, in, s, dt);
+}
+
+// The phase's own torque for GuideStep (everything except the ratchet).
+inline Vec7 PhaseTorque(const GuideParams &p, const GuideInputs &in,
+                        GuideState *s, double dt) {
   const Vec7 limits = JointLimitTorque(
       in.q, in.dq, in.lower, in.upper, p.limit_zone, p.limit_torque,
       p.limit_damping, p.limit_wall_margin, p.hold_kp, p.hold_kd);
   switch (s->phase) {
   case GuidePhase::kFree:
-    return FreeTorque(p, in, s->level);
+    return FreeStep(p, in, s, dt);
   case GuidePhase::kHoldDamp: {
     const bool settled = in.dq.cwiseAbs().maxCoeff() < p.settle_velocity;
     if (settled || s->phase_time >= p.settle_timeout) {
@@ -363,13 +506,103 @@ inline Vec7 GuideStep(const GuideParams &p, const GuideInputs &in,
     if (remaining <= 0.0) {
       s->phase = GuidePhase::kFree;
       s->phase_time = 0.0;
-      return FreeTorque(p, in, s->level);
+      return FreeStep(p, in, s, dt);
     }
     return remaining * HoldTorque(p, in.q, in.dq, s->q_hold, 1.0) +
-           (1.0 - remaining) * FreeTorque(p, in, s->level);
+           (1.0 - remaining) * FreeStep(p, in, s, dt);
   }
   }
   return Vec7::Zero();
+}
+
+// ---------------------------------------------------------------------------
+// Contact limits for streaming
+// ---------------------------------------------------------------------------
+
+// The force the streaming impedance would push with at the contact point if
+// contact stopped the point where it is. The controller's reference torque
+// tau = Kp e + Kd e_dot is a joint deflection Kp^-1 tau, which moves the point
+// by J Kp^-1 tau against the arm's stiffness there, (J Kp^-1 J^T)^-1. Motion
+// the contact does not block (self-motion, sliding the wrist) pushes nothing.
+// Returns infinity when it cannot be computed, so callers fail closed.
+inline Vec3 CommandedPush(const Mat37 &J, const Vec7 &kp, const Vec7 &tau) {
+  const Vec7 compliance = kp.cwiseInverse();
+  const Mat3 C = J * compliance.asDiagonal() * J.transpose();
+  const Vec3 dx = J * compliance.cwiseProduct(tau);
+  const Eigen::LDLT<Mat3> ldlt(C);
+  const Vec3 force = ldlt.solve(dx);
+  if (ldlt.info() != Eigen::Success || !force.allFinite() ||
+      !compliance.allFinite()) {
+    return Vec3::Constant(std::numeric_limits<double>::infinity());
+  }
+  return force;
+}
+
+// Factor in [0, 1] for the reference error that keeps a push within
+// max_force (no limit when max_force <= 0); 0 when the push is unknown.
+inline double PushCapScale(double push, double max_force) {
+  if (!(max_force > 0.0)) {
+    return 1.0;
+  }
+  if (!std::isfinite(push)) {
+    return 0.0;
+  }
+  return push <= max_force ? 1.0 : max_force / push;
+}
+
+// Factor in [0, 1] for a joint velocity reference that keeps the contact
+// point within max_speed (no limit when max_speed <= 0).
+inline double PointSpeedScale(const Mat37 &J, const Vec7 &dq_ref,
+                              double max_speed) {
+  if (!(max_speed > 0.0)) {
+    return 1.0;
+  }
+  const double speed = (J * dq_ref).norm();
+  if (!std::isfinite(speed)) {
+    return 0.0;
+  }
+  return speed <= max_speed ? 1.0 : max_speed / speed;
+}
+
+// Guard on Franka's external force estimate (robot on environment). With
+// nobody touching the arm this is the force at the tool. A load above `force`
+// trips once its excess integrates to `impulse` (so millisecond spikes from
+// the estimate pass), anything above `hard_force` trips at once, and an
+// estimate Franka has zeroed (near a singularity) trips when trip_on_invalid.
+struct ForceGuardParams {
+  double force = 0.0;      // N; 0 disables the guard
+  double impulse = 0.05;   // N s above `force`
+  double hard_force = 0.0; // N; 0 means 1.5 x force
+  bool trip_on_invalid = true;
+};
+
+enum class GuardTrip : int {
+  kNone = 0,
+  kSustained = 1,
+  kHard = 2,
+  kInvalid = 3
+};
+
+inline GuardTrip ForceGuardStep(const ForceGuardParams &p,
+                                const std::array<double, 6> &wrench, double dt,
+                                double *impulse, double *force_out) {
+  const Vec3 force(wrench[0], wrench[1], wrench[2]);
+  const double magnitude = force.allFinite() ? force.norm() : 0.0;
+  if (force_out != nullptr) {
+    *force_out = magnitude;
+  }
+  if (!(p.force > 0.0)) {
+    return GuardTrip::kNone;
+  }
+  if (!WrenchEstimateValid(wrench)) {
+    return p.trip_on_invalid ? GuardTrip::kInvalid : GuardTrip::kNone;
+  }
+  const double hard = p.hard_force > 0.0 ? p.hard_force : 1.5 * p.force;
+  if (magnitude >= hard) {
+    return GuardTrip::kHard;
+  }
+  *impulse = std::max(0.0, *impulse + (magnitude - p.force) * dt);
+  return *impulse > p.impulse ? GuardTrip::kSustained : GuardTrip::kNone;
 }
 
 // The governor band for one tick: the configured speed, tightened to a

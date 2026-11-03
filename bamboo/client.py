@@ -51,6 +51,11 @@ class JointStates(TypedDict, total=False):
     guide_phase: str
     guide_hold_reason: str
     guide_level: float
+    guide_lead: float
+    guide_ratchet: bool
+    contact_scale: float
+    contact_push: float
+    guard_trip: str
 
 
 LOOP_MODES = {0: "idle", 1: "trajectory", 2: "stream", 3: "guide"}
@@ -64,6 +69,8 @@ HOLD_REASONS = {
     5: "stopping",
     6: "idle",
 }
+# Why the last stream yielded (Bamboo's contact guard, or a client's request).
+GUARD_TRIPS = {0: "none", 1: "sustained", 2: "hard", 3: "invalid", 4: "requested"}
 
 
 class BambooFrankaClient:
@@ -305,6 +312,13 @@ class BambooFrankaClient:
             states["guide_phase"] = GUIDE_PHASES.get(int(state_msg["guide_phase"]), "unknown")
             states["guide_hold_reason"] = HOLD_REASONS.get(int(state_msg.get("guide_reason", 0)), "unknown")
             states["guide_level"] = float(state_msg.get("guide_level", 0.0))
+        if "guide_lead" in state_msg:
+            states["guide_lead"] = float(state_msg["guide_lead"])
+            states["guide_ratchet"] = bool(state_msg.get("guide_ratchet", False))
+        if "contact_scale" in state_msg:
+            states["contact_scale"] = float(state_msg["contact_scale"])
+            states["contact_push"] = float(state_msg.get("contact_push", 0.0))
+            states["guard_trip"] = GUARD_TRIPS.get(int(state_msg.get("guard_trip", 0)), "unknown")
         return states
 
     def close(self) -> None:
@@ -574,6 +588,73 @@ class BambooFrankaClient:
         """Clear a Franka reflex so a new control loop can start."""
 
         return self._send_panda_hand_command({"command": "recover_errors"}, timeout_ms=5000)
+
+    def set_contact_limits(
+        self,
+        max_force_n: float = 0.0,
+        contact_point: np.ndarray | list[float] | None = None,
+        max_point_speed: float = 0.0,
+        guard_force_n: float = 0.0,
+        guard_hard_force_n: float = 0.0,
+        guard_impulse_ns: float = 0.05,
+        guard_on_invalid: bool = True,
+        yield_time: float = 0.2,
+        collision_force_n: float = 0.0,
+        shadow: bool = False,
+    ) -> dict:
+        """Limit how hard every following stream can load the tool (needs ``contact_limits``).
+
+        ``max_force_n`` caps the force the stream could push with at
+        ``contact_point`` (m, end-effector frame) if contact stopped it there;
+        ``shadow`` reports that cap in the state without applying it.
+        ``max_point_speed`` (m/s) slows the contact point. The guard watches
+        Franka's external force estimate: above ``guard_force_n`` for
+        ``guard_impulse_ns`` of excess, or at once above
+        ``guard_hard_force_n`` (default 1.5x), the arm goes soft for
+        ``yield_time`` s and the stream ends with the reason. The estimate
+        includes anything the gripper lifts, so set the guard above that.
+        ``collision_force_n`` lowers Franka's own reflex threshold as a last
+        resort; guide mode restores it. 0 leaves a limit off. Only while no
+        control loop runs; the reply echoes what the server applied.
+        """
+
+        point = np.zeros(3) if contact_point is None else np.asarray(contact_point, dtype=float)
+        values = [
+            max_force_n,
+            max_point_speed,
+            guard_force_n,
+            guard_hard_force_n,
+            guard_impulse_ns,
+            yield_time,
+            collision_force_n,
+        ]
+        if point.shape != (3,) or not np.all(np.isfinite(point)) or not np.all(np.isfinite(values)):
+            raise ValueError("contact limits must be finite and contact_point three values")
+        if min(values) < 0:
+            raise ValueError("contact limits must not be negative")
+        data = {
+            "max_force_n": float(max_force_n),
+            "contact_point": point.tolist(),
+            "max_point_speed": float(max_point_speed),
+            "guard_force_n": float(guard_force_n),
+            "guard_hard_force_n": float(guard_hard_force_n),
+            "guard_impulse_ns": float(guard_impulse_ns),
+            "guard_on_invalid": bool(guard_on_invalid),
+            "yield_time": float(yield_time),
+            "collision_force_n": float(collision_force_n),
+            "shadow": bool(shadow),
+        }
+        return self._send_panda_hand_command({"command": "set_contact_limits", "data": data})
+
+    def clear_contact_limits(self) -> dict:
+        """Remove contact limits and restore Bamboo's collision thresholds."""
+
+        return self._send_panda_hand_command({"command": "clear_contact_limits"})
+
+    def yield_streaming(self, reason: str = "") -> dict:
+        """Make an active stream stop pushing (damping only), then end with ``reason``."""
+
+        return self._send_panda_hand_command({"command": "yield_stream", "data": {"reason": str(reason)}})
 
     def _send_robotiq_command(self, command: dict) -> dict:
         """Send a command to the gripper server.

@@ -16,14 +16,20 @@ struct RobotState {
   // near singularities.
   std::vector<double> O_F_ext_hat_K;        // External wrench (6), base frame
   std::vector<double> tau_ext_hat_filtered; // External joint torque (7)
-  int loop_mode = 0;        // 0 idle, 1 trajectory, 2 stream, 3 guide
-  int guide_phase = 0;      // safety::GuidePhase while guiding
-  int guide_reason = 0;     // safety::HoldReason while guiding
-  double guide_level = 0.0; // filtered wall level while guiding
+  int loop_mode = 0;          // 0 idle, 1 trajectory, 2 stream, 3 guide
+  int guide_phase = 0;        // safety::GuidePhase while guiding
+  int guide_reason = 0;       // safety::HoldReason while guiding
+  double guide_level = 0.0;   // filtered wall level while guiding
+  double guide_lead = 0.0;    // rad the arm is ahead of its speed leash
+  bool guide_ratchet = false; // gel ratchet engaged
+  double contact_scale = 1.0; // stream push-cap factor (1: not capping)
+  double contact_push = 0.0;  // N the stream would push with if blocked
+  int guard_trip = 0;         // why the last stream yielded (0: it did not)
 
   MSGPACK_DEFINE_MAP(q, dq, tau_J, O_T_EE, time_sec, O_F_ext_hat_K,
                      tau_ext_hat_filtered, loop_mode, guide_phase, guide_reason,
-                     guide_level)
+                     guide_level, guide_lead, guide_ratchet, contact_scale,
+                     contact_push, guard_trip)
 };
 
 // Waypoint with timing information

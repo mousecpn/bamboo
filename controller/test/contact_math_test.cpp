@@ -485,3 +485,411 @@ TEST(Guide, GovernorBandShrinksWithFrankasLimits) {
   EXPECT_DOUBLE_EQ(high[6], 0.1);
   EXPECT_DOUBLE_EQ(low[6], -0.05);
 }
+
+// ---------------------------------------------------------------------------
+// Speed leash and gel ratchet
+// ---------------------------------------------------------------------------
+
+namespace {
+
+GuideInputs ContactInputs(const Vec7 &q, const Vec7 &dq) {
+  GuideInputs in = FreeInputs(q, dq);
+  in.contact_position = Fr3Chain(q).flange.block<3, 1>(0, 3);
+  return in;
+}
+
+// The arm as a joint-space double integrator under GuideStep plus an external
+// (operator) torque, with bookkeeping for torque steps and controller work.
+struct Sim {
+  Vec7 q = Home();
+  Vec7 dq = Vec7::Zero();
+  GuideState state;
+  double level = 0.0;
+  bool has_direction = false;
+  Vec3 direction = Vec3::Zero();
+  bool fresh = true;
+  bool resume = false;
+  Vec7 previous_tau = Vec7::Zero();
+  bool started = false;
+  double max_torque_step = 0.0;
+
+  GuideInputs Inputs() const {
+    GuideInputs in = ContactInputs(q, dq);
+    in.level = level;
+    in.has_direction = has_direction;
+    in.direction = direction;
+    in.update_fresh = fresh;
+    in.resume_requested = resume;
+    return in;
+  }
+
+  Vec3 Contact() const { return Fr3Chain(q).flange.block<3, 1>(0, 3); }
+
+  // External torque of a force applied at the contact point.
+  Vec7 ForceAtContact(const Vec3 &force) const {
+    return Inputs().J_lin.transpose() * force;
+  }
+
+  Vec7 Step(const GuideParams &p, const Vec7 &external) {
+    const GuideInputs in = Inputs();
+    const Vec7 tau = GuideStep(p, in, &state);
+    if (started) {
+      max_torque_step =
+          std::max(max_torque_step, (tau - previous_tau).cwiseAbs().maxCoeff());
+    }
+    started = true;
+    previous_tau = tau;
+    dq += (tau + external).cwiseQuotient(kInertia) * in.dt;
+    q += dq * in.dt;
+    return tau;
+  }
+};
+
+GuideParams NoIdleHold() {
+  GuideParams p;
+  p.idle_time = 0.0;
+  return p;
+}
+
+} // namespace
+
+TEST(Leash, SlackBelowTheReplaySpeed) {
+  const GuideParams p = NoIdleHold();
+  Sim sim;
+  Vec7 push = Vec7::Zero();
+  push[0] = 2.6; // settles near 0.2 rad/s against damping and friction
+  for (int tick = 0; tick < 3000; ++tick) {
+    sim.Step(p, push);
+  }
+  EXPECT_NEAR(sim.dq[0], 0.2, 0.02);
+  EXPECT_LT(sim.state.lead, 1e-9);
+}
+
+TEST(Leash, AHardPushStillAveragesTheReplaySpeed) {
+  const GuideParams p = NoIdleHold();
+  Vec7 push = Vec7::Zero();
+  push[0] = 25.0; // a hard shove on the base joint
+  push[4] = 8.0;  // and a wrist twist
+  Sim sim;
+  Vec7 q_after_1s;
+  for (int tick = 0; tick < 3000; ++tick) {
+    sim.Step(p, push);
+    if (tick == 999) {
+      q_after_1s = sim.q;
+    }
+  }
+  const Vec7 average = (sim.q - q_after_1s) / 2.0;
+  EXPECT_LE(average[0], 0.35 * 1.01);
+  EXPECT_LE(average[4], 0.35 * 1.01);
+  EXPECT_GT(average[0], 0.30); // held at the limit, not stopped
+  EXPECT_LE(sim.state.lead,
+            p.leash_max_torque.cwiseQuotient(p.leash_kp).maxCoeff() + 1e-9);
+
+  // The same push without the leash runs well past the replay speed (checked
+  // after 1 s, before the joint reaches its limit zone).
+  GuideParams loose = p;
+  loose.leash_max_torque.setZero();
+  Sim free_run;
+  for (int tick = 0; tick < 1000; ++tick) {
+    free_run.Step(loose, push);
+  }
+  EXPECT_GT(free_run.dq[0], 0.8);
+}
+
+TEST(Leash, NeverStretchesPastItsMaxTorque) {
+  const GuideParams p = NoIdleHold();
+  Vec7 push = Vec7::Constant(80.0); // far beyond what it resists
+  Sim sim;
+  for (int tick = 0; tick < 2000; ++tick) {
+    sim.Step(p, push);
+    ASSERT_LE(sim.state.lead,
+              p.leash_max_torque.cwiseQuotient(p.leash_kp).maxCoeff() + 1e-9);
+  }
+}
+
+TEST(Leash, TakesUpAndLetsGoWithoutATorqueStep) {
+  const GuideParams p = NoIdleHold();
+  Sim sim;
+  Vec7 push = Vec7::Zero();
+  push[0] = 25.0;
+  push[5] = 6.0;
+  for (int tick = 0; tick < 1000; ++tick) {
+    sim.Step(p, push);
+  }
+  ASSERT_GT(sim.state.lead, 0.005);
+  for (int tick = 0; tick < 2000; ++tick) {
+    sim.Step(p, Vec7::Zero()); // let go
+  }
+  EXPECT_LT(sim.max_torque_step, 2.0);
+  EXPECT_LT(sim.state.lead, 1e-9);               // slack again
+  EXPECT_LT(sim.dq.cwiseAbs().maxCoeff(), 0.05); // and coasting out
+}
+
+TEST(Leash, AddsNoEnergy) {
+  // The leash alone on a randomly pushed arm: the work it does on the arm,
+  // plus what its spring holds at the end, never exceeds zero.
+  const GuideParams p;
+  std::mt19937 rng(11);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  const Vec7 scale = (Vec7() << 30, 30, 20, 20, 8, 6, 4).finished();
+  Vec7 q = Home(), dq = Vec7::Zero(), shadow = Home(), push = Vec7::Zero();
+  const double dt = 0.001;
+  double work = 0.0, pushed = 0.0;
+  for (int tick = 0; tick < 20000; ++tick) {
+    if (tick % 50 == 0) {
+      for (int i = 0; i < 7; ++i) {
+        push[i] = scale[i] * u(rng);
+      }
+    }
+    const Vec7 tau = LeashTorque(
+        q, dq, Vec7::Constant(-0.35), Vec7::Constant(0.35), dt, p.leash_kp,
+        p.leash_kd, p.leash_max_torque, p.leash_blend, &shadow, nullptr);
+    const Vec7 dq_next =
+        dq + (tau + push - 3.0 * dq).cwiseQuotient(kInertia) * dt;
+    const Vec7 mid = 0.5 * (dq + dq_next);
+    work += tau.dot(mid) * dt;
+    pushed += std::abs(push.dot(mid)) * dt;
+    dq = dq_next;
+    q += dq * dt;
+  }
+  const Vec7 lead = q - shadow;
+  const double stored = 0.5 * lead.cwiseProduct(lead).dot(p.leash_kp);
+  EXPECT_LE(work + stored, 1e-3 * pushed);
+}
+
+TEST(GelRatchet, StopsLoadingButLetsTheArmBackOff) {
+  const GuideParams p = NoIdleHold();
+  Sim sim;
+  sim.level = 1.0;
+  sim.has_direction = true;
+  sim.direction = Vec3(0.0, 0.0, -1.0); // pressing down loads the gel
+  const double start_z = sim.Contact().z();
+  for (int tick = 0; tick < 2000; ++tick) {
+    sim.Step(p, sim.ForceAtContact(Vec3(0.0, 0.0, -20.0)));
+  }
+  EXPECT_TRUE(sim.state.ratchet_engaged);
+  EXPECT_EQ(sim.state.phase, GuidePhase::kFree); // a wall, not a hold
+  const double pressed = start_z - sim.Contact().z();
+  EXPECT_LT(pressed, 1.5 * 20.0 / p.ratchet_stiffness); // ~7 mm of 20 N
+
+  // Backing off is free, and the wall follows.
+  for (int tick = 0; tick < 1000; ++tick) {
+    sim.Step(p, sim.ForceAtContact(Vec3(0.0, 0.0, 15.0)));
+  }
+  const double backed_z = sim.Contact().z();
+  EXPECT_GT(backed_z - start_z, 0.02);
+  EXPECT_NEAR(sim.state.ratchet_anchor.z(), backed_z, 0.002);
+
+  // Pressing again stops near the new anchor, not the old one.
+  for (int tick = 0; tick < 2000; ++tick) {
+    sim.Step(p, sim.ForceAtContact(Vec3(0.0, 0.0, -20.0)));
+  }
+  EXPECT_LT(backed_z - sim.Contact().z(), 1.5 * 20.0 / p.ratchet_stiffness);
+}
+
+TEST(GelRatchet, ReleasesOnlyBelowTheReleaseLevel) {
+  const GuideParams p = NoIdleHold();
+  Sim sim;
+  sim.has_direction = true;
+  sim.direction = Vec3(1.0, 0.0, 0.0);
+  sim.level = 1.0;
+  sim.Step(p, Vec7::Zero());
+  ASSERT_TRUE(sim.state.ratchet_engaged);
+  sim.level = 0.7;
+  sim.Step(p, Vec7::Zero());
+  EXPECT_TRUE(sim.state.ratchet_engaged);
+  sim.level = 0.5;
+  sim.Step(p, Vec7::Zero());
+  EXPECT_FALSE(sim.state.ratchet_engaged);
+}
+
+TEST(GelRatchet, PressingOnItIsNotAnIdleHold) {
+  const GuideParams p; // idle hold on
+  Sim sim;
+  sim.level = 1.0;
+  sim.has_direction = true;
+  sim.direction = Vec3(0.0, 0.0, -1.0);
+  for (int tick = 0; tick < 4000; ++tick) {
+    sim.Step(p, sim.ForceAtContact(Vec3(0.0, 0.0, -15.0)));
+  }
+  EXPECT_TRUE(sim.state.ratchet_engaged);
+  EXPECT_EQ(sim.state.phase, GuidePhase::kFree);
+}
+
+TEST(GelRatchet, AddsNoEnergy) {
+  const GuideParams p;
+  std::mt19937 rng(5);
+  std::uniform_real_distribution<double> u(-1.0, 1.0);
+  Vec7 q = Home(), dq = Vec7::Zero();
+  Vec3 anchor = Fr3Chain(q).flange.block<3, 1>(0, 3);
+  const Vec3 n(0.0, 0.6, -0.8);
+  Vec3 force = Vec3::Zero();
+  const double dt = 0.001;
+  double work = 0.0, pushed = 0.0, depth = 0.0;
+  for (int tick = 0; tick < 20000; ++tick) {
+    if (tick % 40 == 0) {
+      force = 30.0 * Vec3(u(rng), u(rng), u(rng));
+    }
+    const Mat37 J = Fr3Jacobian(q).topRows<3>();
+    const Vec3 point = Fr3Chain(q).flange.block<3, 1>(0, 3);
+    const Vec7 tau = RatchetTorque(J, dq, point, n, p.ratchet_stiffness,
+                                   p.ratchet_damping, &anchor, &depth);
+    const Vec7 push = J.transpose() * force;
+    const Vec7 dq_next =
+        dq + (tau + push - 3.0 * dq).cwiseQuotient(kInertia) * dt;
+    const Vec7 mid = 0.5 * (dq + dq_next);
+    work += tau.dot(mid) * dt;
+    pushed += std::abs(push.dot(mid)) * dt;
+    dq = dq_next;
+    q += dq * dt;
+  }
+  const double stored = 0.5 * p.ratchet_stiffness * depth * depth;
+  EXPECT_LE(work + stored, 1e-2 * pushed);
+}
+
+TEST(GelRatchet, ADirectedLimitDoesNotHold) {
+  const GuideParams p;
+  Sim sim;
+  sim.level = 1.2;
+  sim.has_direction = true;
+  sim.direction = Vec3(0.0, 1.0, 0.0);
+  sim.Step(p, Vec7::Zero());
+  EXPECT_EQ(sim.state.phase, GuidePhase::kFree);
+  EXPECT_EQ(sim.state.reason, HoldReason::kNone);
+  EXPECT_TRUE(sim.state.ratchet_engaged);
+}
+
+TEST(GelRatchet, ResumingWithALoadedGelNeedsADirection) {
+  const GuideParams p;
+  for (const bool directed : {false, true}) {
+    Sim sim;
+    sim.fresh = false;
+    for (int tick = 0; tick < 800; ++tick) {
+      sim.Step(p, Vec7::Zero());
+    }
+    ASSERT_EQ(sim.state.phase, GuidePhase::kHold);
+    sim.fresh = true;
+    sim.level = 0.8;
+    sim.has_direction = directed;
+    sim.direction = Vec3(0.0, 0.0, -1.0);
+    sim.resume = true;
+    sim.Step(p, Vec7::Zero());
+    EXPECT_EQ(sim.state.phase,
+              directed ? GuidePhase::kRelease : GuidePhase::kHold);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Streaming contact limits
+// ---------------------------------------------------------------------------
+
+namespace {
+
+const Vec7 kStreamKp =
+    (Vec7() << 875.0, 1050.0, 1050.0, 875.0, 175.0, 350.0, 87.5).finished();
+
+} // namespace
+
+TEST(Contact, CommandedPushIsTheBlockedArmsContactForce) {
+  // Pin the contact point and let the arm settle under joint stiffness kp
+  // toward a reference offset e: it relaxes in the motions the pin allows
+  // (J dq = 0) and the pin carries J^T F = kp (e - dq). That F must be what
+  // CommandedPush predicts from the reference torque kp e alone.
+  const Mat37 J = Fr3Jacobian(Home()).topRows<3>();
+  std::mt19937 rng(2);
+  std::uniform_real_distribution<double> u(-0.01, 0.01);
+  for (int trial = 0; trial < 20; ++trial) {
+    Vec7 e;
+    for (int i = 0; i < 7; ++i) {
+      e[i] = u(rng);
+    }
+    Eigen::JacobiSVD<Mat37> svd(J, Eigen::ComputeFullV);
+    const Eigen::Matrix<double, 7, 4> N = svd.matrixV().rightCols<4>();
+    const Eigen::Matrix<double, 4, 4> reduced =
+        N.transpose() * kStreamKp.asDiagonal() * N;
+    const Vec7 relaxed =
+        N * reduced.ldlt().solve(N.transpose() * kStreamKp.cwiseProduct(e));
+    const Vec7 residual = kStreamKp.cwiseProduct(e - relaxed);
+    const Vec3 pin_force = (J * J.transpose()).ldlt().solve(J * residual);
+    const Vec3 predicted =
+        CommandedPush(J, kStreamKp, kStreamKp.cwiseProduct(e));
+    EXPECT_LT((predicted - pin_force).norm(), 1e-6 * (1.0 + pin_force.norm()));
+  }
+}
+
+TEST(Contact, MotionTheContactDoesNotBlockPushesNothing) {
+  const Mat37 J = Fr3Jacobian(Home()).topRows<3>();
+  Eigen::JacobiSVD<Mat37> svd(J, Eigen::ComputeFullV);
+  const Vec7 self_motion = svd.matrixV().col(6);
+  const Vec3 push =
+      CommandedPush(J, kStreamKp, kStreamKp.cwiseProduct(0.05 * self_motion));
+  EXPECT_LT(push.norm(), 1e-6);
+}
+
+TEST(Contact, PushCapScaleHoldsTheLimitAndFailsClosed) {
+  EXPECT_DOUBLE_EQ(PushCapScale(5.0, 10.0), 1.0);
+  EXPECT_DOUBLE_EQ(PushCapScale(20.0, 10.0), 0.5);
+  EXPECT_DOUBLE_EQ(PushCapScale(INFINITY, 10.0), 0.0);
+  EXPECT_DOUBLE_EQ(PushCapScale(NAN, 10.0), 0.0);
+  EXPECT_DOUBLE_EQ(PushCapScale(1e9, 0.0), 1.0); // no cap configured
+  // Scaling the reference torque by the factor puts the push on the limit.
+  const Mat37 J = Fr3Jacobian(Home()).topRows<3>();
+  Vec7 e = Vec7::Zero();
+  e[1] = 0.02; // a shoulder reference 0.02 rad into the contact
+  const Vec7 tau = kStreamKp.cwiseProduct(e);
+  const double push = CommandedPush(J, kStreamKp, tau).norm();
+  ASSERT_GT(push, 10.0);
+  const double scale = PushCapScale(push, 10.0);
+  EXPECT_NEAR(CommandedPush(J, kStreamKp, scale * tau).norm(), 10.0, 1e-9);
+}
+
+TEST(Contact, PointSpeedScaleKeepsTheContactPointUnderItsLimit) {
+  const Mat37 J = Fr3Jacobian(Home()).topRows<3>();
+  const Vec7 dq = Vec7::Constant(0.35);
+  const double speed = (J * dq).norm();
+  ASSERT_GT(speed, 0.1);
+  const double scale = PointSpeedScale(J, dq, 0.1);
+  EXPECT_NEAR((J * (scale * dq)).norm(), 0.1, 1e-12);
+  EXPECT_DOUBLE_EQ(PointSpeedScale(J, dq, 0.0), 1.0);
+  EXPECT_DOUBLE_EQ(PointSpeedScale(J, 0.01 * dq, 0.1), 1.0);
+}
+
+TEST(Contact, ForceGuardPassesSpikesButNotSustainedOrHardLoads) {
+  ForceGuardParams p;
+  p.force = 15.0;
+  p.impulse = 0.05;
+  p.hard_force = 25.0;
+  const auto wrench = [](double fz) {
+    return std::array<double, 6>{0.1, 0.0, fz, 0.0, 0.0, 0.0};
+  };
+  double impulse = 0.0, force = 0.0;
+  // 20 N for 5 ms is 0.025 N s over the limit: a spike, not a trip.
+  for (int tick = 0; tick < 5; ++tick) {
+    EXPECT_EQ(ForceGuardStep(p, wrench(20.0), 0.001, &impulse, &force),
+              GuardTrip::kNone);
+  }
+  for (int tick = 0; tick < 100; ++tick) {
+    ForceGuardStep(p, wrench(5.0), 0.001, &impulse, &force);
+  }
+  EXPECT_DOUBLE_EQ(impulse, 0.0); // drained
+  // 17 N sustained trips once 2 N of excess has lasted 25 ms.
+  int ticks = 0;
+  while (ForceGuardStep(p, wrench(17.0), 0.001, &impulse, &force) ==
+         GuardTrip::kNone) {
+    ++ticks;
+    ASSERT_LT(ticks, 1000);
+  }
+  EXPECT_NEAR(ticks, 25, 2);
+  impulse = 0.0;
+  EXPECT_EQ(ForceGuardStep(p, wrench(26.0), 0.001, &impulse, &force),
+            GuardTrip::kHard);
+  EXPECT_NEAR(force, 26.0, 1e-3);
+  EXPECT_EQ(ForceGuardStep(p, {0, 0, 0, 0, 0, 0}, 0.001, &impulse, &force),
+            GuardTrip::kInvalid);
+  p.trip_on_invalid = false;
+  EXPECT_EQ(ForceGuardStep(p, {0, 0, 0, 0, 0, 0}, 0.001, &impulse, &force),
+            GuardTrip::kNone);
+  ForceGuardParams off;
+  EXPECT_EQ(ForceGuardStep(off, wrench(100.0), 0.001, &impulse, &force),
+            GuardTrip::kNone);
+}

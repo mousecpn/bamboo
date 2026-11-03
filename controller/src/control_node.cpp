@@ -16,6 +16,7 @@
 #include <optional>
 #include <queue>
 #include <signal.h>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -125,6 +126,25 @@ std::string GuideStartProblem(franka::RobotMode mode) {
          "unlock the joints and activate FCI, then start guiding again";
 }
 
+// Bamboo's collision thresholds, as main() sets them at startup. Lowering the
+// Cartesian force ones makes Franka itself stop the arm at a smaller force.
+constexpr double kDefaultCollisionThreshold = 100.0;
+// guard_trip value for a stream that yielded because a client asked.
+constexpr int kYieldRequested = 4;
+
+// Contact limits for streaming: set while no loop runs, fixed for the life of
+// each stream, and inert (the stream behaves exactly as before) until set.
+struct ContactLimits {
+  bool enabled = false;
+  bool shadow = false;    // report the push cap without applying it
+  double max_force = 0.0; // N the stream may push with; 0: no cap
+  Eigen::Vector3d contact_point = Eigen::Vector3d::Zero(); // EE frame
+  double max_point_speed = 0.0; // m/s of the contact point; 0: no limit
+  bamboo::safety::ForceGuardParams guard; // off while guard.force is 0
+  double yield_time = 0.2;      // s of damping before a yielded stream ends
+  double collision_force = 0.0; // N for Franka's own reflex; 0: Bamboo's
+};
+
 } // namespace
 
 // Signal handler for graceful shutdown
@@ -204,6 +224,19 @@ private:
   std::atomic<int> guide_phase_{0};
   std::atomic<int> guide_reason_{0};
   std::atomic<double> guide_filtered_level_{0.0};
+  std::atomic<double> guide_lead_{0.0};
+  std::atomic<bool> guide_ratchet_{false};
+
+  // Contact limits: contact_limits_ is written only by the request thread
+  // while no loop runs; the stream thread copies it when it starts.
+  ContactLimits contact_limits_;
+  bool collision_lowered_ = false;
+  std::atomic<double> contact_scale_{1.0};
+  std::atomic<double> contact_push_{0.0};
+  std::atomic<int> guard_trip_{0};
+  std::atomic<bool> stream_yield_requested_{false};
+  std::mutex yield_reason_mutex_;
+  std::string yield_reason_;
 
   // Control parameters
   const int traj_rate_ = 500; // Hz
@@ -308,6 +341,11 @@ public:
       state_msg.guide_phase = guide_phase_.load();
       state_msg.guide_reason = guide_reason_.load();
       state_msg.guide_level = guide_filtered_level_.load();
+      state_msg.guide_lead = guide_lead_.load();
+      state_msg.guide_ratchet = guide_ratchet_.load();
+      state_msg.contact_scale = contact_scale_.load();
+      state_msg.contact_push = contact_push_.load();
+      state_msg.guard_trip = guard_trip_.load();
 
       return state_msg;
     } catch (const franka::Exception &e) {
@@ -350,6 +388,16 @@ public:
     stream_failed_.store(false);
     stream_ready_.store(false);
     setStreamError("");
+    stream_yield_requested_.store(false);
+    guard_trip_.store(0);
+    contact_scale_.store(1.0);
+    contact_push_.store(0.0);
+    if (contact_limits_.enabled && contact_limits_.collision_force > 0.0 &&
+        !collision_lowered_) {
+      // Guide mode restores the default thresholds; put the lower ones back.
+      applyCollisionForce(contact_limits_.collision_force);
+      collision_lowered_ = true;
+    }
     control_running_.store(true);
     stream_running_.store(true);
     stream_thread_ = std::thread(&BambooControlServer::streamControlLoop, this);
@@ -372,11 +420,18 @@ public:
               << " ms, max_velocity=" << stream_max_velocity_
               << " rad/s, max_acceleration=" << stream_max_acceleration_
               << " rad/s^2)" << std::endl;
+    if (contact_limits_.enabled) {
+      std::cout << "[STREAM] " << describeContactLimits(contact_limits_)
+                << std::endl;
+    }
   }
 
   void SetStreamVelocity(const std::vector<double> &velocity) {
     if (!stream_running_.load() || !stream_ready_.load()) {
-      throw std::runtime_error("Streaming control is not running");
+      const std::string error = stream_failed_.load() ? getStreamError() : "";
+      throw std::runtime_error(error.empty()
+                                   ? "Streaming control is not running"
+                                   : "Streaming control stopped: " + error);
     }
     if (velocity.size() != 7) {
       throw std::runtime_error("Velocity must contain seven values");
@@ -412,6 +467,108 @@ public:
       throw std::runtime_error(getStreamError());
     }
     std::cout << "[STREAM] Stopped" << std::endl;
+  }
+
+  ContactLimits SetContactLimits(ContactLimits limits) {
+    if (control_running_.load()) {
+      throw std::runtime_error(
+          "Stop the active control loop before setting contact limits");
+    }
+    const auto within = [](double value, double low, double high) {
+      return std::isfinite(value) && value >= low && value <= high;
+    };
+    if (!within(limits.max_force, 0.0, 100.0)) {
+      throw std::runtime_error("max_force_n must be within 0 to 100 N");
+    }
+    if (!limits.contact_point.allFinite() ||
+        limits.contact_point.norm() > 0.5) {
+      throw std::runtime_error(
+          "contact_point must be within 0.5 m of the end effector");
+    }
+    if (!within(limits.max_point_speed, 0.0, 1.0)) {
+      throw std::runtime_error("max_point_speed must be within 0 to 1 m/s");
+    }
+    if (!within(limits.guard.force, 0.0, 100.0)) {
+      throw std::runtime_error("guard_force_n must be within 0 to 100 N");
+    }
+    if (!within(limits.guard.impulse, 0.001, 1.0)) {
+      throw std::runtime_error(
+          "guard_impulse_ns must be within 0.001 to 1 N s");
+    }
+    if (!within(limits.guard.hard_force, 0.0, 150.0) ||
+        (limits.guard.hard_force > 0.0 &&
+         limits.guard.hard_force < limits.guard.force)) {
+      throw std::runtime_error("guard_hard_force_n must be 0, or between "
+                               "guard_force_n and 150 N");
+    }
+    if (!within(limits.yield_time, 0.05, 1.0)) {
+      throw std::runtime_error("yield_time must be within 0.05 to 1 s");
+    }
+    if (!(limits.collision_force == 0.0 ||
+          within(limits.collision_force, 5.0, 100.0))) {
+      throw std::runtime_error(
+          "collision_force_n must be 0 or within 5 to 100 N");
+    }
+    if (limits.collision_force > 0.0) {
+      applyCollisionForce(limits.collision_force);
+      collision_lowered_ = true;
+    } else if (collision_lowered_) {
+      applyCollisionForce(0.0);
+      collision_lowered_ = false;
+    }
+    limits.enabled = true;
+    contact_limits_ = limits;
+    std::cout << "[CONTACT] " << describeContactLimits(contact_limits_)
+              << std::endl;
+    return contact_limits_;
+  }
+
+  void ClearContactLimits() {
+    if (control_running_.load()) {
+      throw std::runtime_error(
+          "Stop the active control loop before clearing contact limits");
+    }
+    if (collision_lowered_) {
+      applyCollisionForce(0.0);
+      collision_lowered_ = false;
+    }
+    contact_limits_ = ContactLimits();
+    std::cout << "[CONTACT] Limits cleared" << std::endl;
+  }
+
+  ContactLimits GetContactLimits() const { return contact_limits_; }
+
+  // Stop pushing and end the stream, e.g. when the client's gel guard trips.
+  void YieldStream(const std::string &reason) {
+    if (!stream_running_.load() || !stream_ready_.load()) {
+      throw std::runtime_error("Streaming control is not running");
+    }
+    {
+      std::lock_guard<std::mutex> lock(yield_reason_mutex_);
+      yield_reason_ = reason;
+    }
+    stream_yield_requested_.store(true);
+  }
+
+  static std::string describeContactLimits(const ContactLimits &limits) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(1) << "Contact limits: push cap "
+         << (limits.max_force > 0.0 ? std::to_string(limits.max_force) + " N"
+                                    : std::string("off"))
+         << (limits.shadow ? " (shadow: reported, not applied)" : "")
+         << ", point speed "
+         << (limits.max_point_speed > 0.0
+                 ? std::to_string(limits.max_point_speed) + " m/s"
+                 : std::string("off"))
+         << ", guard "
+         << (limits.guard.force > 0.0
+                 ? std::to_string(limits.guard.force) + " N"
+                 : std::string("off"))
+         << ", Franka reflex "
+         << (limits.collision_force > 0.0
+                 ? std::to_string(limits.collision_force) + " N"
+                 : std::string("default"));
+    return text.str();
   }
 
   struct GuideOptions {
@@ -500,6 +657,8 @@ public:
     guide_phase_.store(0);
     guide_reason_.store(0);
     guide_filtered_level_.store(0.0);
+    guide_lead_.store(0.0);
+    guide_ratchet_.store(false);
     // Starting counts as the first update, so the watchdog runs from here.
     guide_update_ns_.store(steadyNowNanoseconds());
     guide_stop_requested_.store(false);
@@ -520,6 +679,14 @@ public:
     const std::string mode_problem = GuideStartProblem(start_state.robot_mode);
     if (!mode_problem.empty()) {
       throw std::runtime_error(mode_problem);
+    }
+    if (collision_lowered_) {
+      // A guiding hand is an external force too: lowered thresholds would
+      // make Franka stop the arm under it.
+      applyCollisionForce(0.0);
+      collision_lowered_ = false;
+      std::cout << "[GUIDE] Restored Bamboo's collision thresholds for guiding"
+                << std::endl;
     }
     if (bamboo::safety::WrenchEstimateValid(start_state.O_F_ext_hat_K)) {
       const double force = Eigen::Vector3d(start_state.O_F_ext_hat_K[0],
@@ -900,6 +1067,33 @@ private:
     state_time_.store(state.time.toSec(), std::memory_order_relaxed);
   }
 
+  std::string describeYield(int reason, double force,
+                            const ContactLimits &limits) {
+    std::ostringstream text;
+    text << std::fixed << std::setprecision(1);
+    switch (reason) {
+    case static_cast<int>(bamboo::safety::GuardTrip::kSustained):
+      text << "Contact guard: Franka's external force estimate stayed above "
+           << limits.guard.force << " N (" << force << " N)";
+      break;
+    case static_cast<int>(bamboo::safety::GuardTrip::kHard):
+      text << "Contact guard: Franka's external force estimate reached "
+           << force << " N, over the hard limit";
+      break;
+    case static_cast<int>(bamboo::safety::GuardTrip::kInvalid):
+      text << "Contact guard: Franka's external force estimate is unavailable "
+              "(near a singularity)";
+      break;
+    default: {
+      std::lock_guard<std::mutex> lock(yield_reason_mutex_);
+      text << "Yielded on request"
+           << (yield_reason_.empty() ? "" : ": " + yield_reason_);
+    }
+    }
+    text << "; the arm went soft and streaming stopped";
+    return text.str();
+  }
+
   void setStreamError(const std::string &message) {
     std::lock_guard<std::mutex> lock(stream_error_mutex_);
     stream_error_message_ = message;
@@ -916,6 +1110,21 @@ private:
       throw std::runtime_error(error.empty() ? "Guide mode is not running"
                                              : "Guide mode stopped: " + error);
     }
+  }
+
+  // Franka's reflex thresholds: the Cartesian force ones at `force` (0 for
+  // Bamboo's default), everything else at Bamboo's default.
+  void applyCollisionForce(double force) {
+    const double f = force > 0.0 ? force : kDefaultCollisionThreshold;
+    std::array<double, 7> joints;
+    joints.fill(kDefaultCollisionThreshold);
+    const std::array<double, 6> cartesian = {f,
+                                             f,
+                                             f,
+                                             kDefaultCollisionThreshold,
+                                             kDefaultCollisionThreshold,
+                                             kDefaultCollisionThreshold};
+    robot_->setCollisionBehavior(joints, joints, cartesian, cartesian);
   }
 
   void setGuideError(const std::string &message) {
@@ -969,6 +1178,8 @@ private:
         in.J_lin =
             bamboo::safety::PointJacobian(J, rotation * guide_contact_point_);
         in.J_ang = J.bottomRows<3>();
+        in.contact_position =
+            pose.topRightCorner<3, 1>() + rotation * guide_contact_point_;
 
         const int64_t now = steadyNowNanoseconds();
         in.update_fresh = now - guide_update_ns_.load() <=
@@ -996,6 +1207,8 @@ private:
         guide_phase_.store(static_cast<int>(state.phase));
         guide_reason_.store(static_cast<int>(state.reason));
         guide_filtered_level_.store(state.level);
+        guide_lead_.store(state.lead);
+        guide_ratchet_.store(state.ratchet_engaged);
 
         std::array<double, 7> torques{};
         for (int i = 0; i < 7; ++i) {
@@ -1039,6 +1252,16 @@ private:
         desired_position[static_cast<int>(i)] = state_q_[i].load();
       }
       controller_->RestoreDefaultGains();
+      // Contact limits are fixed for the life of this stream.
+      const ContactLimits limits = contact_limits_;
+      const Vector7d kp = controller_->Kp();
+      const Vector7d kd = controller_->Kd();
+      const Vector7d yield_damping = bamboo::safety::GuideParams().hold_damping;
+      double guard_impulse = 0.0;
+      bool yielding = false;
+      double yield_elapsed = 0.0;
+      int trip_reason = 0;
+      double trip_force = 0.0;
       stream_ready_.store(true);
 
       auto control_callback = [&](const franka::RobotState &robot_state,
@@ -1046,6 +1269,43 @@ private:
         cacheRobotState(robot_state);
         q_current_ = Eigen::Map<const Vector7d>(robot_state.q.data());
         const double dt = std::clamp(period.toSec(), 0.0001, 0.01);
+        const Vector7d measured_velocity =
+            Eigen::Map<const Vector7d>(robot_state.dq.data());
+
+        // A tripped guard, or a client asking to yield: stop pushing (damping
+        // only) so the contact can unload, then end the stream.
+        if (!yielding) {
+          double force = 0.0;
+          const bamboo::safety::GuardTrip trip =
+              limits.enabled
+                  ? bamboo::safety::ForceGuardStep(limits.guard,
+                                                   robot_state.O_F_ext_hat_K,
+                                                   dt, &guard_impulse, &force)
+                  : bamboo::safety::GuardTrip::kNone;
+          if (trip != bamboo::safety::GuardTrip::kNone ||
+              stream_yield_requested_.load()) {
+            yielding = true;
+            trip_reason = trip != bamboo::safety::GuardTrip::kNone
+                              ? static_cast<int>(trip)
+                              : kYieldRequested;
+            trip_force = force;
+            guard_trip_.store(trip_reason);
+          }
+        }
+        if (yielding) {
+          yield_elapsed += dt;
+          std::array<double, 7> damping{};
+          for (int i = 0; i < 7; ++i) {
+            damping[i] = -yield_damping[i] * measured_velocity[i];
+          }
+          const std::array<double, 7> torques = franka::limitRate(
+              franka::kMaxTorqueRate, damping, robot_state.tau_J_d);
+          if (yield_elapsed >= limits.yield_time) {
+            return franka::MotionFinished(franka::Torques(torques));
+          }
+          return franka::Torques(torques);
+        }
+
         Vector7d requested_velocity;
         const int64_t command_age_ns =
             steadyNowNanoseconds() - stream_last_update_ns_.load();
@@ -1071,7 +1331,22 @@ private:
           const double difference = requested_velocity[i] - desired_velocity[i];
           desired_velocity[i] +=
               std::clamp(difference, -max_velocity_delta, max_velocity_delta);
+        }
 
+        bamboo::safety::Mat37 J_point = bamboo::safety::Mat37::Zero();
+        if (limits.enabled) {
+          const std::array<double, 42> jacobian =
+              model_->zeroJacobian(franka::Frame::kEndEffector, robot_state);
+          const Mat67 J = Eigen::Map<const Mat67>(jacobian.data());
+          const Eigen::Matrix4d pose =
+              Eigen::Map<const Eigen::Matrix4d>(robot_state.O_T_EE.data());
+          J_point = bamboo::safety::PointJacobian(
+              J, pose.topLeftCorner<3, 3>() * limits.contact_point);
+          desired_velocity *= bamboo::safety::PointSpeedScale(
+              J_point, desired_velocity, limits.max_point_speed);
+        }
+
+        for (int i = 0; i < 7; ++i) {
           const double next = desired_position[i] + desired_velocity[i] * dt;
           const double lower = joint_lower_[i] + kJointMargin;
           const double upper = joint_upper_[i] - kJointMargin;
@@ -1088,6 +1363,30 @@ private:
               robot_state.q[i] + kMaxTrackingError);
         }
 
+        if (limits.enabled && limits.max_force > 0.0) {
+          // Push cap: scale the reference toward the measured state until the
+          // controller could push no harder than max_force at the contact
+          // point if the contact stopped it there.
+          const Vector7d q = Eigen::Map<const Vector7d>(robot_state.q.data());
+          const Vector7d position_error = desired_position - q;
+          const Vector7d velocity_error = desired_velocity - measured_velocity;
+          const Eigen::Vector3d push = bamboo::safety::CommandedPush(
+              J_point, kp,
+              kp.cwiseProduct(position_error) +
+                  kd.cwiseProduct(velocity_error));
+          const double push_norm =
+              push.allFinite() ? push.norm()
+                               : std::numeric_limits<double>::infinity();
+          const double scale =
+              bamboo::safety::PushCapScale(push_norm, limits.max_force);
+          contact_push_.store(push_norm);
+          contact_scale_.store(scale);
+          if (!limits.shadow && scale < 1.0) {
+            desired_position = q + scale * position_error;
+            desired_velocity = measured_velocity + scale * velocity_error;
+          }
+        }
+
         const bamboo::controllers::ControllerResult result = controller_->Step(
             robot_state, desired_position, desired_velocity, Vector7d::Zero());
         const std::array<double, 7> torques = franka::limitRate(
@@ -1098,8 +1397,6 @@ private:
           return franka::MotionFinished(franka::Torques(torques));
         }
 
-        const Vector7d measured_velocity =
-            Eigen::Map<const Vector7d>(robot_state.dq.data());
         const double stop_age_seconds =
             static_cast<double>(steadyNowNanoseconds() -
                                 stream_stop_request_ns_.load()) /
@@ -1112,6 +1409,13 @@ private:
       };
 
       robot_->control(control_callback);
+      if (yielding) {
+        const std::string message =
+            describeYield(trip_reason, trip_force, limits);
+        stream_failed_.store(true);
+        setStreamError(message);
+        std::cout << "[STREAM] " << message << std::endl;
+      }
     } catch (const franka::Exception &e) {
       stream_failed_.store(true);
       setStreamError(std::string("Franka streaming control error: ") +
@@ -1482,11 +1786,42 @@ std::string parseCommand(const RequestMap &request_map) {
   return command;
 }
 
+std::vector<double> toVector(const Eigen::Vector3d &value) {
+  return {value.x(), value.y(), value.z()};
+}
+
+void packContactLimits(msgpack::packer<msgpack::sbuffer> &packer,
+                       const ContactLimits &limits) {
+  packer.pack_map(11);
+  packer.pack("enabled");
+  packer.pack(limits.enabled);
+  packer.pack("shadow");
+  packer.pack(limits.shadow);
+  packer.pack("max_force_n");
+  packer.pack(limits.max_force);
+  packer.pack("contact_point");
+  packer.pack(toVector(limits.contact_point));
+  packer.pack("max_point_speed");
+  packer.pack(limits.max_point_speed);
+  packer.pack("guard_force_n");
+  packer.pack(limits.guard.force);
+  packer.pack("guard_hard_force_n");
+  packer.pack(limits.guard.hard_force);
+  packer.pack("guard_impulse_ns");
+  packer.pack(limits.guard.impulse);
+  packer.pack("guard_on_invalid");
+  packer.pack(limits.guard.trip_on_invalid);
+  packer.pack("yield_time");
+  packer.pack(limits.yield_time);
+  packer.pack("collision_force_n");
+  packer.pack(limits.collision_force);
+}
+
 msgpack::sbuffer handleGetCapabilities(BambooControlServer &server) {
   const BambooControlServer::Payload payload = server.GetPayload();
   msgpack::sbuffer response_buf;
   msgpack::packer<msgpack::sbuffer> packer(response_buf);
-  packer.pack_map(4);
+  packer.pack_map(5);
   packer.pack("success");
   packer.pack(true);
   packer.pack("protocol_version");
@@ -1494,7 +1829,10 @@ msgpack::sbuffer handleGetCapabilities(BambooControlServer &server) {
   packer.pack("features");
   packer.pack(std::vector<std::string>{
       "stream_joint_velocity", "cached_robot_state", "watchdog",
-      "external_wrench", "guide_mode", "set_load", "recover_errors"});
+      "external_wrench", "guide_mode", "set_load", "recover_errors",
+      "guide_speed_leash", "gel_ratchet", "contact_limits"});
+  packer.pack("contact_limits");
+  packContactLimits(packer, server.GetContactLimits());
   packer.pack("payload");
   packer.pack_map(6);
   packer.pack("m_ee");
@@ -1597,6 +1935,51 @@ msgpack::sbuffer handleSetLoad(BambooControlServer &server,
   server.SetLoad(valueOr<double>(data, "mass", 0.0),
                  valueOr<std::vector<double>>(data, "center_of_mass", {}),
                  valueOr<std::vector<double>>(data, "inertia", {}));
+  return packSuccess();
+}
+
+msgpack::sbuffer handleSetContactLimits(BambooControlServer &server,
+                                        const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  ContactLimits limits;
+  limits.shadow = valueOr<bool>(data, "shadow", false);
+  limits.max_force = valueOr<double>(data, "max_force_n", 0.0);
+  const std::vector<double> point =
+      valueOr<std::vector<double>>(data, "contact_point", {0.0, 0.0, 0.0});
+  if (point.size() != 3) {
+    throw std::runtime_error("contact_point must contain three values");
+  }
+  limits.contact_point = Eigen::Vector3d(point[0], point[1], point[2]);
+  limits.max_point_speed = valueOr<double>(data, "max_point_speed", 0.0);
+  limits.guard.force = valueOr<double>(data, "guard_force_n", 0.0);
+  limits.guard.hard_force = valueOr<double>(data, "guard_hard_force_n", 0.0);
+  limits.guard.impulse = valueOr<double>(data, "guard_impulse_ns", 0.05);
+  limits.guard.trip_on_invalid = valueOr<bool>(data, "guard_on_invalid", true);
+  limits.yield_time = valueOr<double>(data, "yield_time", 0.2);
+  limits.collision_force = valueOr<double>(data, "collision_force_n", 0.0);
+  const ContactLimits applied = server.SetContactLimits(limits);
+
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(3);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  packer.pack("limits");
+  packContactLimits(packer, applied);
+  return response_buf;
+}
+
+msgpack::sbuffer handleClearContactLimits(BambooControlServer &server) {
+  server.ClearContactLimits();
+  return packSuccess();
+}
+
+msgpack::sbuffer handleYieldStream(BambooControlServer &server,
+                                   const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  server.YieldStream(valueOr<std::string>(data, "reason", ""));
   return packSuccess();
 }
 
@@ -1880,6 +2263,12 @@ void RunServer(const std::string &server_address, franka::Robot *robot,
           response_buf = handleSetLoad(server, request_map);
         } else if (command == "recover_errors") {
           response_buf = handleRecoverErrors(server);
+        } else if (command == "set_contact_limits") {
+          response_buf = handleSetContactLimits(server, request_map);
+        } else if (command == "clear_contact_limits") {
+          response_buf = handleClearContactLimits(server);
+        } else if (command == "yield_stream") {
+          response_buf = handleYieldStream(server, request_map);
         } else if (command == "execute_trajectory") {
           response_buf = handleExecuteTrajectory(server, request_map);
         } else if (command == "open_gripper") {

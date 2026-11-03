@@ -186,19 +186,33 @@ with BambooFrankaClient(server_ip="172.16.0.20", enable_gripper=False) as robot:
 
 What the arm does:
 
-- **Free:** light joint damping and a small, smooth friction. Joints resist
-  above `max_joint_velocity` (and within half of Franka's position-dependent
-  velocity limits). Near a position limit a joint is pushed back softly, and
-  within 0.05 rad by a stiff one-way wall that keeps it off Franka's hard
-  limit; moving away is never blocked, so this needs no resume.
+- **Free:** light joint damping and a small, smooth friction. Near a position
+  limit a joint is pushed back softly, and within 0.05 rad by a stiff one-way
+  wall that keeps it off Franka's hard limit; moving away is never blocked, so
+  this needs no resume.
+- **Speed leash:** no joint can be moved faster than `max_joint_velocity`
+  (also kept within half of Franka's position-dependent limits), so every
+  guided motion can be replayed by streaming at that speed. Each joint has a
+  shadow that may only move that fast: below the speed it sits on the joint
+  and nothing is felt; faster, the joint gets ahead of it and a spring with
+  Bamboo's streaming stiffness pulls back, up to 40 N m on the large joints
+  (20 and 10 N m on the wrist). Only a push beyond that drags the shadow
+  along. `get_joint_states()["guide_lead"]` is how far ahead the arm is.
 - **Idle hold:** left still for `idle_hold_s` (default 1 s), the arm holds its
   pose, and breaks free again when pushed. Set it to 0 to turn this off.
-- **Safety holds:** stale updates, `update_guiding(valid=False)` or a wall
-  `level` of 1 make the arm damp to a stop and hold until `resume_guiding()`,
-  which the controller only honours once the cause has cleared.
-- **Wall:** `update_guiding(level, direction=...)` adds a one-way damper that
-  resists motion along `direction` (end-effector frame) at
-  `level * wall_damping` N s/m, while motion back the other way stays free.
+- **Safety holds:** stale updates or `update_guiding(valid=False)` make the
+  arm damp to a stop and hold until `resume_guiding()`, which the controller
+  only honours once updates are fresh and valid again. A `level` of 1 without
+  a `direction` holds the same way.
+- **Gel wall:** `update_guiding(level, direction=...)` reports how loaded the
+  gel is (1 = its limit) and the end-effector direction in which arm motion
+  loads it further. Rising levels add a one-way damper against motion along
+  `direction` (`level * wall_damping` N s/m). At level 1 a one-way spring
+  (3000 N/m, the "ratchet") stops the contact point advancing any further
+  along it, while backing off and moving sideways stay free; the ratchet
+  follows every retreat and lets go below level 0.6. This is a wall, not a
+  hold, so the arm can always be moved off the load. A hand can still push
+  through a wall; it limits, it does not guarantee.
 
 The arm floats only as well as gravity is compensated. Guide mode refuses to
 start while Franka's external force estimate exceeds `max_start_force`
@@ -218,6 +232,44 @@ guide mode.
 The external wrench and torque estimates are reported in `get_joint_states()`
 as `ext_wrench` and `tau_ext` (robot on environment) when the server supports
 the `external_wrench` feature.
+
+### Contact limits for streaming
+
+`set_contact_limits()` (feature `contact_limits`) protects a tool, or a
+tactile sensor holding it, from every following stream, at 1 kHz. Until it is
+called, streaming behaves exactly as before. Each layer is optional (0 = off):
+
+```python
+robot.set_contact_limits(
+    max_force_n=15.0,            # push cap at the contact point
+    contact_point=[0, 0, 0.20],  # m, end-effector frame
+    guard_force_n=20.0,          # Franka's force estimate: yield above this...
+    guard_hard_force_n=30.0,     # ...or at once above this
+    collision_force_n=35.0,      # Franka's own reflex threshold, the last resort
+)
+```
+
+- **Push cap:** the stream's impedance torque is converted into the force it
+  would press with at the contact point if the contact stopped the point
+  there; the reference is pulled toward the measured state so that force
+  stays within `max_force_n`. Free motion presses with almost nothing, so it
+  is not slowed. `shadow=True` reports the cap (`contact_push`,
+  `contact_scale` in the state) without applying it, for tuning.
+- **Point speed:** `max_point_speed` (m/s) slows the contact point.
+- **Guard:** Franka's external force estimate above `guard_force_n` for
+  `guard_impulse_ns` of excess, above `guard_hard_force_n` at once, or
+  unavailable near a singularity: the arm goes soft (damping only) for
+  `yield_time` s, so the contact unloads instead of freezing, then the stream
+  ends and the next `stream_joint_velocity` says why (`guard_trip` in the
+  state). The estimate also counts anything the gripper lifts, so set the
+  guard above that; it suits contact tasks, not lifting ones.
+- **Franka reflex:** `collision_force_n` lowers Franka's own Cartesian force
+  threshold, which stops the arm even if Bamboo misbehaved. Guide mode puts
+  Bamboo's default back, since a guiding hand would trip it.
+
+`yield_streaming(reason)` makes a stream go soft and end the same way, for a
+client-side guard (a gel's own load signal, say). Limits stay set until
+`clear_contact_limits()` or a restart, and every reply echoes what applied.
 
 **Manual Start:** If you need to run servers manually, first run the C++ control node:
 

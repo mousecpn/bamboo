@@ -104,3 +104,45 @@ def test_set_load_validates_before_sending() -> None:
     client.close()
     _finish(context, server, thread)
     assert requests[-1] == {"command": "set_load", "data": {"mass": 0.9, "center_of_mass": [0.0, 0.0, 0.06]}}
+
+
+def test_contact_limits_protocol() -> None:
+    applied = {"enabled": True, "max_force_n": 12.0, "guard_force_n": 18.0}
+    context, server, thread, port, requests = _serve(
+        {
+            "get_robot_state": {"success": True, "data": STATE},
+            "set_contact_limits": {"success": True, "error": "", "limits": applied},
+        },
+        count=4,
+    )
+    client = BambooFrankaClient(server_ip="127.0.0.1", control_port=port, enable_gripper=False)
+    for bad in ({"max_force_n": float("nan")}, {"guard_force_n": -1.0}, {"contact_point": [0.0, 0.1]}):
+        try:
+            client.set_contact_limits(**bad)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"{bad} must be rejected locally")
+    response = client.set_contact_limits(max_force_n=12, contact_point=[0, 0, 0.2], guard_force_n=18, shadow=True)
+    assert response["limits"] == applied
+    assert client.clear_contact_limits()["success"]
+    assert client.yield_streaming("gel at its limit")["success"]
+    client.close()
+    _finish(context, server, thread)
+    commands = [request["command"] for request in requests]
+    assert commands == ["get_robot_state", "set_contact_limits", "clear_contact_limits", "yield_stream"]
+    sent = requests[1]["data"]
+    assert sent["max_force_n"] == 12.0 and sent["contact_point"] == [0.0, 0.0, 0.2] and sent["shadow"] is True
+    assert sent["guard_impulse_ns"] == 0.05 and sent["guard_on_invalid"] is True and sent["collision_force_n"] == 0.0
+    assert requests[3]["data"] == {"reason": "gel at its limit"}
+
+
+def test_contact_and_leash_state_is_read_only_when_present() -> None:
+    newer = dict(STATE, guide_lead=0.012, guide_ratchet=True, contact_scale=0.5, contact_push=24.0, guard_trip=2)
+    context, server, thread, port, _ = _serve({"get_robot_state": {"success": True, "data": newer}}, count=2)
+    client = BambooFrankaClient(server_ip="127.0.0.1", control_port=port, enable_gripper=False)
+    states = client.get_joint_states()
+    client.close()
+    _finish(context, server, thread)
+    assert states["guide_lead"] == 0.012 and states["guide_ratchet"] is True
+    assert states["contact_scale"] == 0.5 and states["contact_push"] == 24.0 and states["guard_trip"] == "hard"

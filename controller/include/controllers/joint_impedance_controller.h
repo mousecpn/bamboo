@@ -34,6 +34,8 @@ public:
 
   // Restore default controller gains
   void RestoreDefaultGains();
+  const Eigen::Matrix<double, 7, 1> &Kp() const { return Kp_; }
+  const Eigen::Matrix<double, 7, 1> &Kd() const { return Kd_; }
 
 private:
   franka::Model *model_;

@@ -30,7 +30,12 @@ class BambooGripperError(Exception):
 
 
 class JointStates(TypedDict, total=False):
-    """Type definition for joint states dictionary."""
+    """Type definition for joint states dictionary.
+
+    The keys after ``gripper_is_moving`` are present only when the server
+    reports them (servers with the ``external_wrench`` / ``guide_mode``
+    features); older servers simply leave them out.
+    """
 
     ee_pose: list[list[float]]
     qpos: list[float]
@@ -40,6 +45,25 @@ class JointStates(TypedDict, total=False):
     gripper_state: float
     gripper_is_grasped: bool
     gripper_is_moving: bool
+    ext_wrench: list[float]
+    tau_ext: list[float]
+    loop_mode: str
+    guide_phase: str
+    guide_hold_reason: str
+    guide_level: float
+
+
+LOOP_MODES = {0: "idle", 1: "trajectory", 2: "stream", 3: "guide"}
+GUIDE_PHASES = {0: "free", 1: "hold_damp", 2: "hold_ramp", 3: "hold", 4: "release"}
+HOLD_REASONS = {
+    0: "none",
+    1: "watchdog",
+    2: "gel_invalid",
+    3: "gel_limit",
+    4: "joint_limit",
+    5: "stopping",
+    6: "idle",
+}
 
 
 class BambooFrankaClient:
@@ -68,6 +92,7 @@ class BambooFrankaClient:
         self.enable_gripper = enable_gripper
         self.gripper_type = gripper_type
         self._streaming = False
+        self._guiding = False
 
         # Validate gripper type
         if gripper_type not in ["robotiq", "franka"]:
@@ -259,7 +284,7 @@ class BambooFrankaClient:
             gripper_is_grasped = False
             gripper_is_moving = False
 
-        return {
+        states: JointStates = {
             "ee_pose": ee_pose,
             "qpos": qpos,
             "dq": dq,
@@ -269,6 +294,18 @@ class BambooFrankaClient:
             "gripper_is_grasped": gripper_is_grasped,
             "gripper_is_moving": gripper_is_moving,
         }
+        # Newer servers add these; read them only when present.
+        if "O_F_ext_hat_K" in state_msg:
+            states["ext_wrench"] = list(state_msg["O_F_ext_hat_K"])
+        if "tau_ext_hat_filtered" in state_msg:
+            states["tau_ext"] = list(state_msg["tau_ext_hat_filtered"])
+        if "loop_mode" in state_msg:
+            states["loop_mode"] = LOOP_MODES.get(int(state_msg["loop_mode"]), "unknown")
+        if "guide_phase" in state_msg:
+            states["guide_phase"] = GUIDE_PHASES.get(int(state_msg["guide_phase"]), "unknown")
+            states["guide_hold_reason"] = HOLD_REASONS.get(int(state_msg.get("guide_reason", 0)), "unknown")
+            states["guide_level"] = float(state_msg.get("guide_level", 0.0))
+        return states
 
     def close(self) -> None:
         """Clean up ZMQ resources."""
@@ -277,6 +314,11 @@ class BambooFrankaClient:
                 self.stop_streaming()
             except Exception as e:
                 _log.error(f"Failed to stop stream cleanly; server watchdog will brake the robot: {e}")
+        if getattr(self, "_guiding", False):
+            try:
+                self.stop_guiding()
+            except Exception as e:
+                _log.error(f"Failed to stop guiding cleanly; the server watchdog will hold the arm: {e}")
         if hasattr(self, "control_socket") and self.control_socket is not None:
             self.control_socket.close()
         if hasattr(self, "gripper_socket") and self.gripper_socket is not None:
@@ -406,6 +448,132 @@ class BambooFrankaClient:
         if response.get("success", False):
             self._streaming = False
         return response
+
+    def supports(self, feature: str) -> bool:
+        """Return whether the control node advertises ``feature``."""
+
+        response = self.get_capabilities()
+        return bool(response.get("success", False) and feature in response.get("features", []))
+
+    def start_guiding(
+        self,
+        watchdog_ms: int = 250,
+        max_joint_velocity: float = 0.35,
+        joint_damping: np.ndarray | list[float] | None = None,
+        contact_point: np.ndarray | list[float] | None = None,
+        wall_damping: float | None = None,
+        idle_hold_s: float | None = None,
+        max_start_force: float | None = None,
+    ) -> dict:
+        """Start hand guiding: the arm floats under gravity compensation.
+
+        The arm moves freely under light damping. Joints resist above
+        ``max_joint_velocity`` (rad/s) and near their limits. If no
+        :meth:`update_guiding` arrives within ``watchdog_ms``, the arm damps to
+        a stop and holds until :meth:`resume_guiding`. ``contact_point`` (m,
+        end-effector frame) is where the gel wall acts; ``wall_damping`` is its
+        damping at level 1 (N s/m). After ``idle_hold_s`` of stillness (0 turns
+        it off) the arm holds until pushed. The server refuses to start while
+        Franka's external force estimate exceeds ``max_start_force`` (N; 0
+        disables), which catches an uncompensated payload.
+        """
+
+        if not 50 <= watchdog_ms <= 500:
+            raise ValueError("watchdog_ms must be between 50 and 500")
+        if max_joint_velocity <= 0:
+            raise ValueError("max_joint_velocity must be positive")
+        data: dict = {"watchdog_ms": int(watchdog_ms), "max_joint_velocity": float(max_joint_velocity)}
+        if joint_damping is not None:
+            damping = np.asarray(joint_damping, dtype=float)
+            if damping.shape != (7,) or not np.all(np.isfinite(damping)) or np.any(damping < 0):
+                raise ValueError("joint_damping must be seven finite, non-negative values")
+            data["joint_damping"] = damping.tolist()
+        if contact_point is not None:
+            point = np.asarray(contact_point, dtype=float)
+            if point.shape != (3,) or not np.all(np.isfinite(point)):
+                raise ValueError("contact_point must be three finite values")
+            data["contact_point"] = point.tolist()
+        if wall_damping is not None:
+            if not np.isfinite(wall_damping) or wall_damping < 0:
+                raise ValueError("wall_damping must be finite and non-negative")
+            data["wall_damping"] = float(wall_damping)
+        if idle_hold_s is not None:
+            if not np.isfinite(idle_hold_s) or idle_hold_s < 0:
+                raise ValueError("idle_hold_s must be finite and non-negative")
+            data["idle_hold_s"] = float(idle_hold_s)
+        if max_start_force is not None:
+            if not np.isfinite(max_start_force) or max_start_force < 0:
+                raise ValueError("max_start_force must be finite and non-negative")
+            data["max_start_force"] = float(max_start_force)
+        response = self._send_panda_hand_command({"command": "start_guide", "data": data})
+        if response.get("success", False):
+            self._guiding = True
+        return response
+
+    def update_guiding(
+        self,
+        level: float = 0.0,
+        valid: bool = True,
+        direction: np.ndarray | list[float] | None = None,
+        seq: int | None = None,
+    ) -> dict:
+        """Keep guiding alive and set the gel wall.
+
+        ``level`` (0 to 1) scales the wall; 1 or ``valid=False`` makes the arm
+        hold. ``direction`` (end-effector frame) is the motion the wall resists;
+        leave it out to damp all motion. ``seq`` must increase between updates
+        for the watchdog to count them; it defaults to this host's monotonic
+        clock, so send an update only when there is something new to say.
+        """
+
+        data: dict = {
+            "level": float(level),
+            "valid": bool(valid),
+            "seq": int(time.monotonic_ns() if seq is None else seq),
+        }
+        if direction is not None:
+            vector = np.asarray(direction, dtype=float)
+            if vector.shape != (3,):
+                raise ValueError("direction must have three values")
+            data["direction"] = vector.tolist()
+        return self._send_panda_hand_command({"command": "guide_update", "data": data})
+
+    def resume_guiding(self) -> dict:
+        """Ask the arm to leave a hold. The server refuses unless it is safe."""
+
+        return self._send_panda_hand_command({"command": "guide_resume"})
+
+    def stop_guiding(self) -> dict:
+        """Bring the arm to a hold and end hand guiding."""
+
+        response = self._send_panda_hand_command({"command": "stop_guide"}, timeout_ms=5000)
+        if response.get("success", False):
+            self._guiding = False
+        return response
+
+    def set_load(
+        self,
+        mass: float,
+        center_of_mass: np.ndarray | list[float],
+        inertia: np.ndarray | list[float] | None = None,
+    ) -> dict:
+        """Tell Franka about a payload beyond Desk's end effector (kg, m in the flange frame)."""
+
+        com = np.asarray(center_of_mass, dtype=float)
+        if not np.isfinite(mass) or mass < 0 or com.shape != (3,) or not np.all(np.isfinite(com)):
+            raise ValueError("mass must be non-negative and center_of_mass three finite values")
+        data: dict = {"mass": float(mass), "center_of_mass": com.tolist()}
+        if inertia is not None:
+            matrix = np.asarray(inertia, dtype=float).reshape(-1)
+            if matrix.shape != (9,) or not np.all(np.isfinite(matrix)):
+                raise ValueError("inertia must be nine finite values")
+            data["inertia"] = matrix.tolist()
+        return self._send_panda_hand_command({"command": "set_load", "data": data})
+
+    def recover_errors(self) -> dict:
+        """Clear a Franka reflex so a new control loop can start."""
+
+        return self._send_panda_hand_command({"command": "recover_errors"}, timeout_ms=5000)
 
     def _send_robotiq_command(self, command: dict) -> dict:
         """Send a command to the gripper server.

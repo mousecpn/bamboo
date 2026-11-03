@@ -12,8 +12,18 @@ struct RobotState {
   std::vector<double> tau_J;  // Joint torques (7)
   std::vector<double> O_T_EE; // End-effector pose (16 - 4x4 matrix)
   double time_sec;
+  // Franka's estimates, robot on environment. The wrench is zeroed by Franka
+  // near singularities.
+  std::vector<double> O_F_ext_hat_K;        // External wrench (6), base frame
+  std::vector<double> tau_ext_hat_filtered; // External joint torque (7)
+  int loop_mode = 0;        // 0 idle, 1 trajectory, 2 stream, 3 guide
+  int guide_phase = 0;      // safety::GuidePhase while guiding
+  int guide_reason = 0;     // safety::HoldReason while guiding
+  double guide_level = 0.0; // filtered wall level while guiding
 
-  MSGPACK_DEFINE_MAP(q, dq, tau_J, O_T_EE, time_sec)
+  MSGPACK_DEFINE_MAP(q, dq, tau_J, O_T_EE, time_sec, O_F_ext_hat_K,
+                     tau_ext_hat_filtered, loop_mode, guide_phase, guide_reason,
+                     guide_level)
 };
 
 // Waypoint with timing information

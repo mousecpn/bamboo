@@ -164,6 +164,52 @@ Only one control mode can own the robot at a time. Stop streaming before sending
 a planned trajectory. A software watchdog is not a replacement for the robot's
 physical E-stop.
 
+### Hand guiding without the guiding buttons
+
+Guide mode floats the arm under Franka's gravity compensation so it can be
+moved by hand without holding the Pilot's guiding buttons. Every update keeps it
+alive; if updates stop for `watchdog_ms`, the arm damps to a stop and holds.
+
+```python
+with BambooFrankaClient(server_ip="172.16.0.20", enable_gripper=False) as robot:
+    assert robot.supports("guide_mode")
+    result = robot.start_guiding(watchdog_ms=250, max_joint_velocity=0.35)
+    if not result["success"]:
+        raise RuntimeError(result["error"])
+    try:
+        for _ in range(300):  # at least every watchdog period
+            robot.update_guiding()  # level 0: no wall
+            time.sleep(1 / 30)
+    finally:
+        robot.stop_guiding()
+```
+
+What the arm does:
+
+- **Free:** light joint damping and a small, smooth friction. Joints resist
+  above `max_joint_velocity` (and within half of Franka's position-dependent
+  velocity limits) and are pushed back softly near their position limits.
+- **Idle hold:** left still for `idle_hold_s` (default 1 s), the arm holds its
+  pose, and breaks free again when pushed. Set it to 0 to turn this off.
+- **Safety holds:** stale updates, `update_guiding(valid=False)`, a wall
+  `level` of 1, or a joint within 0.05 rad of its limit make the arm damp to a
+  stop and hold until `resume_guiding()`, which the controller only honours
+  once the cause has cleared.
+- **Wall:** `update_guiding(level, direction=...)` adds a one-way damper that
+  resists motion along `direction` (end-effector frame) at
+  `level * wall_damping` N s/m, while motion back the other way stays free.
+
+The arm floats only as well as gravity is compensated. Guide mode refuses to
+start while Franka's external force estimate exceeds `max_start_force`
+(default 5 N): an uncompensated payload would make it sink. Declare a payload
+beyond Desk's end effector with `set_load(mass, center_of_mass)` while no loop
+is running, and check `get_capabilities()["payload"]`. After a reflex,
+`recover_errors()` clears it without restarting the node.
+
+The external wrench and torque estimates are reported in `get_joint_states()`
+as `ext_wrench` and `tau_ext` (robot on environment) when the server supports
+the `external_wrench` feature.
+
 **Manual Start:** If you need to run servers manually, first run the C++ control node:
 
 ```bash

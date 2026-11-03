@@ -36,6 +36,7 @@
 #include "bamboo_messages.h"
 #include "controllers/joint_impedance_controller.h"
 #include "interpolators/joint_interpolator.h"
+#include "safety/contact_math.h"
 
 // Global flag for signal handling
 std::atomic<bool> global_shutdown{false};
@@ -78,6 +79,14 @@ constexpr double kHardMaxStreamVelocity = 0.50;
 constexpr double kHardMaxStreamAcceleration = 2.0;
 constexpr int kHardMaxWatchdogMs = 500;
 constexpr double kMaxTrackingError = 0.03;
+// Hand guiding.
+constexpr double kHardMaxGuideVelocity = 1.0;
+constexpr double kGuideVelocityFraction = 0.5; // of Franka's position-dependent
+                                               // joint velocity limits
+constexpr double kGuideStopTimeout = 2.0;
+constexpr std::array<double, 7> kGuideTorqueLimits = {60.0, 60.0, 60.0, 60.0,
+                                                      30.0, 15.0, 15.0};
+using Mat67 = Eigen::Matrix<double, 6, 7>;
 
 int64_t steadyNowNanoseconds() {
   return std::chrono::duration_cast<std::chrono::nanoseconds>(
@@ -129,6 +138,42 @@ private:
   double stream_max_velocity_{0.35};
   double stream_max_acceleration_{1.5};
 
+  // Franka's external wrench/torque estimates and the configured payload,
+  // cached alongside the rest of the state.
+  std::array<std::atomic<double>, 6> state_wrench_;
+  std::array<std::atomic<double>, 7> state_tau_ext_;
+  std::atomic<double> state_m_ee_{0.0};
+  std::atomic<double> state_m_load_{0.0};
+  std::atomic<double> state_m_total_{0.0};
+  std::array<std::atomic<double>, 3> state_com_ee_;
+  std::array<std::atomic<double>, 3> state_com_load_;
+  std::array<std::atomic<double>, 3> state_com_total_;
+
+  // Persistent hand-guiding loop, same ownership pattern as streaming: the
+  // parameters are written before the thread starts, and everything the ZMQ
+  // thread changes afterwards is atomic.
+  std::atomic<bool> guide_running_{false};
+  std::atomic<bool> guide_ready_{false};
+  std::atomic<bool> guide_stop_requested_{false};
+  std::atomic<bool> guide_failed_{false};
+  std::thread guide_thread_;
+  std::mutex guide_error_mutex_;
+  std::string guide_error_message_;
+  bamboo::safety::GuideParams guide_params_;
+  Eigen::Vector3d guide_contact_point_ = Eigen::Vector3d::Zero(); // EE frame
+  int guide_watchdog_ms_{250};
+  double guide_max_velocity_{0.35};
+  std::atomic<double> guide_level_{0.0};
+  std::atomic<bool> guide_level_valid_{true};
+  std::atomic<bool> guide_has_direction_{false};
+  std::array<std::atomic<double>, 3> guide_direction_; // EE frame, unit
+  std::atomic<uint64_t> guide_last_seq_{0};
+  std::atomic<int64_t> guide_update_ns_{0};
+  std::atomic<uint64_t> guide_resume_requests_{0};
+  std::atomic<int> guide_phase_{0};
+  std::atomic<int> guide_reason_{0};
+  std::atomic<double> guide_filtered_level_{0.0};
+
   // Control parameters
   const int traj_rate_ = 500; // Hz
   const double max_time = 1.0;
@@ -167,6 +212,9 @@ public:
     for (auto &value : stream_target_velocity_) {
       value.store(0.0);
     }
+    for (auto &value : guide_direction_) {
+      value.store(0.0);
+    }
 
     std::cout << "Initial joint positions: " << q_current_.transpose()
               << std::endl;
@@ -178,13 +226,18 @@ public:
     } catch (const std::exception &e) {
       std::cerr << "[STREAM] Error during shutdown: " << e.what() << std::endl;
     }
+    try {
+      StopGuide();
+    } catch (const std::exception &e) {
+      std::cerr << "[GUIDE] Error during shutdown: " << e.what() << std::endl;
+    }
   }
 
   bamboo_msgs::RobotState GetRobotState() {
     try {
       // readOnce cannot run concurrently with robot.control(). During a stream,
       // return the lock-free state cache populated by the control callback.
-      if (!stream_running_.load()) {
+      if (!stream_running_.load() && !guide_running_.load()) {
         cacheRobotState(robot_->readOnce());
       }
 
@@ -208,6 +261,22 @@ public:
 
       // Add timing information
       state_msg.time_sec = state_time_.load();
+
+      state_msg.O_F_ext_hat_K.resize(6);
+      for (size_t i = 0; i < 6; ++i) {
+        state_msg.O_F_ext_hat_K[i] = state_wrench_[i].load();
+      }
+      state_msg.tau_ext_hat_filtered.resize(7);
+      for (size_t i = 0; i < 7; ++i) {
+        state_msg.tau_ext_hat_filtered[i] = state_tau_ext_[i].load();
+      }
+      state_msg.loop_mode = guide_running_.load()     ? 3
+                            : stream_running_.load()  ? 2
+                            : control_running_.load() ? 1
+                                                      : 0;
+      state_msg.guide_phase = guide_phase_.load();
+      state_msg.guide_reason = guide_reason_.load();
+      state_msg.guide_level = guide_filtered_level_.load();
 
       return state_msg;
     } catch (const franka::Exception &e) {
@@ -312,6 +381,282 @@ public:
       throw std::runtime_error(getStreamError());
     }
     std::cout << "[STREAM] Stopped" << std::endl;
+  }
+
+  struct GuideOptions {
+    int watchdog_ms = 250;
+    double max_joint_velocity = 0.35;
+    std::vector<double> joint_damping; // empty: default
+    std::vector<double> contact_point; // EE frame; empty: flange
+    double wall_damping = -1.0;        // negative: default
+    double idle_hold_s = -1.0;         // negative: default, 0: off
+    // Refuse to start when Franka's external force estimate exceeds this:
+    // an uncompensated payload (or a hand already on the arm) would make the
+    // floating arm sink. 0 disables the check.
+    double max_start_force = 5.0;
+  };
+
+  void StartGuide(const GuideOptions &options) {
+    if (guide_running_.load()) {
+      throw std::runtime_error("Guide mode is already running");
+    }
+    if (control_running_.load()) {
+      throw std::runtime_error("Another control loop is already running");
+    }
+    if (guide_thread_.joinable()) {
+      guide_thread_.join();
+    }
+
+    bamboo::safety::GuideParams params;
+    if (!options.joint_damping.empty()) {
+      if (options.joint_damping.size() != 7) {
+        throw std::runtime_error("joint_damping must contain seven values");
+      }
+      for (int i = 0; i < 7; ++i) {
+        const double value = options.joint_damping[i];
+        // Keep free-mode damping well inside the hold damping.
+        if (!std::isfinite(value) || value < 0.0 ||
+            value > 0.5 * params.hold_damping[i]) {
+          throw std::runtime_error("joint_damping value out of range");
+        }
+        params.damping[i] = value;
+      }
+    }
+    if (options.wall_damping >= 0.0) {
+      if (!std::isfinite(options.wall_damping) ||
+          options.wall_damping > 150.0) {
+        throw std::runtime_error("wall_damping must be within 0 to 150 N s/m");
+      }
+      params.wall_damping = options.wall_damping;
+    }
+    Eigen::Vector3d contact = Eigen::Vector3d::Zero();
+    if (!options.contact_point.empty()) {
+      if (options.contact_point.size() != 3) {
+        throw std::runtime_error("contact_point must contain three values");
+      }
+      contact =
+          Eigen::Vector3d(options.contact_point[0], options.contact_point[1],
+                          options.contact_point[2]);
+      if (!contact.allFinite() || contact.norm() > 0.5) {
+        throw std::runtime_error(
+            "contact_point must be within 0.5 m of the end effector");
+      }
+    }
+    if (!std::isfinite(options.max_joint_velocity)) {
+      throw std::runtime_error("max_joint_velocity must be finite");
+    }
+    if (options.idle_hold_s >= 0.0) {
+      if (!std::isfinite(options.idle_hold_s) || options.idle_hold_s > 10.0) {
+        throw std::runtime_error("idle_hold_s must be within 0 to 10 s");
+      }
+      params.idle_time = options.idle_hold_s;
+    }
+    if (!std::isfinite(options.max_start_force) ||
+        options.max_start_force < 0.0 || options.max_start_force > 30.0) {
+      throw std::runtime_error("max_start_force must be within 0 to 30 N");
+    }
+
+    guide_params_ = params;
+    guide_contact_point_ = contact;
+    guide_watchdog_ms_ =
+        std::clamp(options.watchdog_ms, 50, kHardMaxWatchdogMs);
+    guide_max_velocity_ =
+        std::clamp(options.max_joint_velocity, 0.05, kHardMaxGuideVelocity);
+    guide_level_.store(0.0);
+    guide_level_valid_.store(true);
+    guide_has_direction_.store(false);
+    guide_last_seq_.store(0);
+    guide_phase_.store(0);
+    guide_reason_.store(0);
+    guide_filtered_level_.store(0.0);
+    // Starting counts as the first update, so the watchdog runs from here.
+    guide_update_ns_.store(steadyNowNanoseconds());
+    guide_stop_requested_.store(false);
+    guide_failed_.store(false);
+    guide_ready_.store(false);
+    {
+      std::lock_guard<std::mutex> lock(guide_error_mutex_);
+      guide_error_message_.clear();
+    }
+    const franka::RobotState start_state = robot_->readOnce();
+    cacheRobotState(start_state);
+    if (bamboo::safety::WrenchEstimateValid(start_state.O_F_ext_hat_K)) {
+      const double force = Eigen::Vector3d(start_state.O_F_ext_hat_K[0],
+                                           start_state.O_F_ext_hat_K[1],
+                                           start_state.O_F_ext_hat_K[2])
+                               .norm();
+      std::cout << "[GUIDE] External force estimate at start: " << force << " N"
+                << std::endl;
+      if (options.max_start_force > 0.0 && force > options.max_start_force) {
+        throw std::runtime_error(
+            "External force estimate is " + std::to_string(force) +
+            " N before guiding starts (limit " +
+            std::to_string(options.max_start_force) +
+            " N). Let go of the arm, or set the payload with set_load if "
+            "the gripper's weight is not compensated");
+      }
+    } else if (options.max_start_force > 0.0) {
+      std::cout << "[GUIDE] External force estimate unavailable at start "
+                   "(near a singularity); start check skipped"
+                << std::endl;
+    }
+    control_running_.store(true);
+    guide_running_.store(true);
+    guide_thread_ = std::thread(&BambooControlServer::guideControlLoop, this);
+
+    const auto deadline = SteadyClock::now() + std::chrono::seconds(2);
+    while (!guide_ready_.load() && guide_running_.load() &&
+           SteadyClock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    if (!guide_ready_.load()) {
+      guide_stop_requested_.store(true);
+      if (guide_thread_.joinable()) {
+        guide_thread_.join();
+      }
+      const std::string error = getGuideError();
+      throw std::runtime_error(error.empty() ? "Guide mode did not start"
+                                             : error);
+    }
+    std::cout << "[GUIDE] Started (watchdog=" << guide_watchdog_ms_
+              << " ms, max_velocity=" << guide_max_velocity_ << " rad/s)"
+              << std::endl;
+  }
+
+  struct GuideStatus {
+    bool stale = false;
+    int phase = 0;
+    int reason = 0;
+    double level = 0.0;
+  };
+
+  GuideStatus GuideUpdate(double level, bool valid,
+                          const std::vector<double> &direction, uint64_t seq) {
+    requireGuideRunning();
+    GuideStatus status;
+    // A repeated or older sequence number is not news: it must not keep the
+    // watchdog alive, or a sender stuck on one gel frame would hide a stall.
+    if (seq <= guide_last_seq_.load()) {
+      status.stale = true;
+    } else {
+      Eigen::Vector3d d = Eigen::Vector3d::Zero();
+      bool has_direction = false;
+      if (direction.size() == 3) {
+        d = Eigen::Vector3d(direction[0], direction[1], direction[2]);
+        has_direction = d.allFinite() && d.norm() > 1e-6;
+        if (has_direction) {
+          d.normalize();
+        }
+      }
+      for (int i = 0; i < 3; ++i) {
+        guide_direction_[i].store(has_direction ? d[i] : 0.0);
+      }
+      guide_has_direction_.store(has_direction);
+      guide_level_.store(level);
+      guide_level_valid_.store(valid);
+      guide_last_seq_.store(seq);
+      guide_update_ns_.store(steadyNowNanoseconds());
+    }
+    status.phase = guide_phase_.load();
+    status.reason = guide_reason_.load();
+    status.level = guide_filtered_level_.load();
+    return status;
+  }
+
+  GuideStatus GuideResume() {
+    requireGuideRunning();
+    guide_resume_requests_.fetch_add(1);
+    GuideStatus status;
+    status.phase = guide_phase_.load();
+    status.reason = guide_reason_.load();
+    status.level = guide_filtered_level_.load();
+    return status;
+  }
+
+  void StopGuide() {
+    if (!guide_running_.load() && !guide_thread_.joinable()) {
+      return;
+    }
+    guide_stop_requested_.store(true);
+    if (guide_thread_.joinable()) {
+      guide_thread_.join();
+    }
+    if (guide_failed_.load()) {
+      throw std::runtime_error(getGuideError());
+    }
+    std::cout << "[GUIDE] Stopped" << std::endl;
+  }
+
+  void SetLoad(double mass, const std::vector<double> &com,
+               const std::vector<double> &inertia) {
+    if (control_running_.load()) {
+      throw std::runtime_error(
+          "Stop the active control loop before setting the load");
+    }
+    if (!std::isfinite(mass) || mass < 0.0 || mass > 3.0) {
+      throw std::runtime_error("load mass must be within 0 to 3 kg");
+    }
+    if (com.size() != 3) {
+      throw std::runtime_error("load center of mass must contain three values");
+    }
+    std::array<double, 3> com_array{};
+    for (int i = 0; i < 3; ++i) {
+      if (!std::isfinite(com[i]) || std::abs(com[i]) > 0.5) {
+        throw std::runtime_error(
+            "load center of mass must be within 0.5 m of the flange");
+      }
+      com_array[i] = com[i];
+    }
+    // A small point-mass inertia unless the caller knows better.
+    std::array<double, 9> inertia_array{1e-3, 0, 0, 0, 1e-3, 0, 0, 0, 1e-3};
+    if (!inertia.empty()) {
+      if (inertia.size() != 9) {
+        throw std::runtime_error("load inertia must contain nine values");
+      }
+      for (int i = 0; i < 9; ++i) {
+        if (!std::isfinite(inertia[i])) {
+          throw std::runtime_error("load inertia must be finite");
+        }
+        inertia_array[i] = inertia[i];
+      }
+    }
+    robot_->setLoad(mass, com_array, inertia_array);
+    cacheRobotState(robot_->readOnce());
+    std::cout << "[LOAD] Set " << mass << " kg at (" << com_array[0] << ", "
+              << com_array[1] << ", " << com_array[2] << ") m" << std::endl;
+  }
+
+  // Clears a reflex (e.g. a velocity or torque limit hit while guiding) so a
+  // new loop can start without restarting the node.
+  void RecoverErrors() {
+    if (control_running_.load()) {
+      throw std::runtime_error(
+          "Stop the active control loop before recovering errors");
+    }
+    robot_->automaticErrorRecovery();
+    cacheRobotState(robot_->readOnce());
+    std::cout << "[SERVER] Error recovery done" << std::endl;
+  }
+
+  struct Payload {
+    double m_ee, m_load, m_total;
+    std::array<double, 3> com_ee, com_load, com_total;
+  };
+
+  Payload GetPayload() {
+    if (!control_running_.load()) {
+      cacheRobotState(robot_->readOnce());
+    }
+    Payload payload{};
+    payload.m_ee = state_m_ee_.load();
+    payload.m_load = state_m_load_.load();
+    payload.m_total = state_m_total_.load();
+    for (int i = 0; i < 3; ++i) {
+      payload.com_ee[i] = state_com_ee_[i].load();
+      payload.com_load[i] = state_com_load_[i].load();
+      payload.com_total[i] = state_com_total_[i].load();
+    }
+    return payload;
   }
 
   bool ExecuteJointImpedanceTrajectory(
@@ -496,6 +841,21 @@ private:
     for (size_t i = 0; i < 16; ++i) {
       state_pose_[i].store(state.O_T_EE[i], std::memory_order_relaxed);
     }
+    for (size_t i = 0; i < 6; ++i) {
+      state_wrench_[i].store(state.O_F_ext_hat_K[i], std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < 7; ++i) {
+      state_tau_ext_[i].store(state.tau_ext_hat_filtered[i],
+                              std::memory_order_relaxed);
+    }
+    state_m_ee_.store(state.m_ee, std::memory_order_relaxed);
+    state_m_load_.store(state.m_load, std::memory_order_relaxed);
+    state_m_total_.store(state.m_total, std::memory_order_relaxed);
+    for (size_t i = 0; i < 3; ++i) {
+      state_com_ee_[i].store(state.F_x_Cee[i], std::memory_order_relaxed);
+      state_com_load_[i].store(state.F_x_Cload[i], std::memory_order_relaxed);
+      state_com_total_[i].store(state.F_x_Ctotal[i], std::memory_order_relaxed);
+    }
     state_time_.store(state.time.toSec(), std::memory_order_relaxed);
   }
 
@@ -507,6 +867,122 @@ private:
   std::string getStreamError() {
     std::lock_guard<std::mutex> lock(stream_error_mutex_);
     return stream_error_message_;
+  }
+
+  void requireGuideRunning() {
+    if (!guide_running_.load() || !guide_ready_.load()) {
+      const std::string error = getGuideError();
+      throw std::runtime_error(error.empty() ? "Guide mode is not running"
+                                             : "Guide mode stopped: " + error);
+    }
+  }
+
+  void setGuideError(const std::string &message) {
+    std::lock_guard<std::mutex> lock(guide_error_mutex_);
+    guide_error_message_ = message;
+  }
+
+  std::string getGuideError() {
+    std::lock_guard<std::mutex> lock(guide_error_mutex_);
+    return guide_error_message_;
+  }
+
+  void guideControlLoop() {
+    try {
+      bamboo::safety::GuideState state;
+      uint64_t seen_resume = guide_resume_requests_.load();
+      int64_t stop_started_ns = 0;
+      bamboo::safety::Vec7 lower, upper;
+      for (int i = 0; i < 7; ++i) {
+        lower[i] = joint_lower_[i];
+        upper[i] = joint_upper_[i];
+      }
+      guide_ready_.store(true);
+
+      auto control_callback = [&](const franka::RobotState &robot_state,
+                                  franka::Duration period) -> franka::Torques {
+        cacheRobotState(robot_state);
+        bamboo::safety::GuideInputs in;
+        in.q = Eigen::Map<const Vector7d>(robot_state.q.data());
+        in.dq = Eigen::Map<const Vector7d>(robot_state.dq.data());
+        in.lower = lower;
+        in.upper = upper;
+        in.dt = std::clamp(period.toSec(), 0.0001, 0.01);
+        bamboo::safety::GovernorBand(
+            franka::computeUpperLimitsJointVelocity(robot_state.q),
+            franka::computeLowerLimitsJointVelocity(robot_state.q),
+            guide_max_velocity_, kGuideVelocityFraction, &in.velocity_low,
+            &in.velocity_high);
+
+        const std::array<double, 42> jacobian =
+            model_->zeroJacobian(franka::Frame::kEndEffector, robot_state);
+        const Mat67 J = Eigen::Map<const Mat67>(jacobian.data());
+        const Eigen::Matrix4d pose =
+            Eigen::Map<const Eigen::Matrix4d>(robot_state.O_T_EE.data());
+        const Eigen::Matrix3d rotation = pose.topLeftCorner<3, 3>();
+        in.J_lin =
+            bamboo::safety::PointJacobian(J, rotation * guide_contact_point_);
+        in.J_ang = J.bottomRows<3>();
+
+        const int64_t now = steadyNowNanoseconds();
+        in.update_fresh = now - guide_update_ns_.load() <=
+                          static_cast<int64_t>(guide_watchdog_ms_) * 1000000;
+        in.level = guide_level_.load();
+        in.level_valid = guide_level_valid_.load();
+        in.has_direction = guide_has_direction_.load();
+        if (in.has_direction) {
+          const Eigen::Vector3d direction_ee(guide_direction_[0].load(),
+                                             guide_direction_[1].load(),
+                                             guide_direction_[2].load());
+          in.direction = (rotation * direction_ee).normalized();
+        }
+        const uint64_t resume = guide_resume_requests_.load();
+        in.resume_requested = resume != seen_resume;
+        seen_resume = resume;
+        in.stop_requested =
+            guide_stop_requested_.load() || global_shutdown.load();
+        if (in.stop_requested && stop_started_ns == 0) {
+          stop_started_ns = now;
+        }
+
+        const bamboo::safety::Vec7 tau =
+            bamboo::safety::GuideStep(guide_params_, in, &state);
+        guide_phase_.store(static_cast<int>(state.phase));
+        guide_reason_.store(static_cast<int>(state.reason));
+        guide_filtered_level_.store(state.level);
+
+        std::array<double, 7> torques{};
+        for (int i = 0; i < 7; ++i) {
+          const double value = std::isfinite(tau[i]) ? tau[i] : 0.0;
+          torques[i] =
+              std::clamp(value, -kGuideTorqueLimits[i], kGuideTorqueLimits[i]);
+        }
+        torques = franka::limitRate(franka::kMaxTorqueRate, torques,
+                                    robot_state.tau_J_d);
+
+        if (in.stop_requested) {
+          const bool still = in.dq.cwiseAbs().maxCoeff() < 0.01;
+          const double stopping_for =
+              static_cast<double>(now - stop_started_ns) / 1e9;
+          if ((state.phase == bamboo::safety::GuidePhase::kHold && still) ||
+              stopping_for > kGuideStopTimeout) {
+            return franka::MotionFinished(franka::Torques(torques));
+          }
+        }
+        return franka::Torques(torques);
+      };
+
+      robot_->control(control_callback);
+    } catch (const franka::Exception &e) {
+      guide_failed_.store(true);
+      setGuideError(std::string("Franka guide control error: ") + e.what());
+    } catch (const std::exception &e) {
+      guide_failed_.store(true);
+      setGuideError(std::string("Guide control error: ") + e.what());
+    }
+    guide_ready_.store(false);
+    guide_running_.store(false);
+    control_running_.store(false);
   }
 
   void streamControlLoop() {
@@ -960,18 +1436,122 @@ std::string parseCommand(const RequestMap &request_map) {
   return command;
 }
 
-msgpack::sbuffer handleGetCapabilities() {
+msgpack::sbuffer handleGetCapabilities(BambooControlServer &server) {
+  const BambooControlServer::Payload payload = server.GetPayload();
   msgpack::sbuffer response_buf;
   msgpack::packer<msgpack::sbuffer> packer(response_buf);
-  packer.pack_map(3);
+  packer.pack_map(4);
   packer.pack("success");
   packer.pack(true);
   packer.pack("protocol_version");
   packer.pack(1);
   packer.pack("features");
-  packer.pack(std::vector<std::string>{"stream_joint_velocity",
-                                       "cached_robot_state", "watchdog"});
+  packer.pack(std::vector<std::string>{
+      "stream_joint_velocity", "cached_robot_state", "watchdog",
+      "external_wrench", "guide_mode", "set_load", "recover_errors"});
+  packer.pack("payload");
+  packer.pack_map(6);
+  packer.pack("m_ee");
+  packer.pack(payload.m_ee);
+  packer.pack("m_load");
+  packer.pack(payload.m_load);
+  packer.pack("m_total");
+  packer.pack(payload.m_total);
+  packer.pack("F_x_Cee");
+  packer.pack(
+      std::vector<double>(payload.com_ee.begin(), payload.com_ee.end()));
+  packer.pack("F_x_Cload");
+  packer.pack(
+      std::vector<double>(payload.com_load.begin(), payload.com_load.end()));
+  packer.pack("F_x_Ctotal");
+  packer.pack(
+      std::vector<double>(payload.com_total.begin(), payload.com_total.end()));
   return response_buf;
+}
+
+msgpack::sbuffer
+packGuideStatus(const BambooControlServer::GuideStatus &status) {
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(6);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  packer.pack("stale");
+  packer.pack(status.stale);
+  packer.pack("phase");
+  packer.pack(status.phase);
+  packer.pack("reason");
+  packer.pack(status.reason);
+  packer.pack("level");
+  packer.pack(status.level);
+  return response_buf;
+}
+
+msgpack::sbuffer packSuccess() {
+  msgpack::sbuffer response_buf;
+  msgpack::packer<msgpack::sbuffer> packer(response_buf);
+  packer.pack_map(2);
+  packer.pack("success");
+  packer.pack(true);
+  packer.pack("error");
+  packer.pack(std::string(""));
+  return response_buf;
+}
+
+msgpack::sbuffer handleStartGuide(BambooControlServer &server,
+                                  const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  BambooControlServer::GuideOptions options;
+  options.watchdog_ms = valueOr<int>(data, "watchdog_ms", 250);
+  options.max_joint_velocity =
+      valueOr<double>(data, "max_joint_velocity", 0.35);
+  options.joint_damping =
+      valueOr<std::vector<double>>(data, "joint_damping", {});
+  options.contact_point =
+      valueOr<std::vector<double>>(data, "contact_point", {});
+  options.wall_damping = valueOr<double>(data, "wall_damping", -1.0);
+  options.idle_hold_s = valueOr<double>(data, "idle_hold_s", -1.0);
+  options.max_start_force = valueOr<double>(data, "max_start_force", 5.0);
+  server.StartGuide(options);
+  return packSuccess();
+}
+
+msgpack::sbuffer handleGuideUpdate(BambooControlServer &server,
+                                   const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  return packGuideStatus(server.GuideUpdate(
+      valueOr<double>(data, "level", 0.0), valueOr<bool>(data, "valid", true),
+      valueOr<std::vector<double>>(data, "direction", {}),
+      valueOr<uint64_t>(data, "seq", 0)));
+}
+
+msgpack::sbuffer handleGuideResume(BambooControlServer &server) {
+  return packGuideStatus(server.GuideResume());
+}
+
+msgpack::sbuffer handleStopGuide(BambooControlServer &server) {
+  server.StopGuide();
+  return packSuccess();
+}
+
+msgpack::sbuffer handleRecoverErrors(BambooControlServer &server) {
+  server.RecoverErrors();
+  return packSuccess();
+}
+
+msgpack::sbuffer handleSetLoad(BambooControlServer &server,
+                               const RequestMap &request_map) {
+  const RequestMap data = getRequestData(request_map);
+  const auto mass = data.find("mass");
+  if (mass == data.end()) {
+    throw std::runtime_error("set_load requires mass");
+  }
+  server.SetLoad(valueOr<double>(data, "mass", 0.0),
+                 valueOr<std::vector<double>>(data, "center_of_mass", {}),
+                 valueOr<std::vector<double>>(data, "inertia", {}));
+  return packSuccess();
 }
 
 msgpack::sbuffer handleStartStream(BambooControlServer &server,
@@ -1222,14 +1802,18 @@ void RunServer(const std::string &server_address, franka::Robot *robot,
       obj.convert(request_map);
 
       std::string command = parseCommand(request_map);
-      std::cout << "[SERVER] Received command: " << command << std::endl;
+      // guide_update arrives with every gel frame; logging it would only add
+      // console latency to the watchdog path.
+      if (command != "guide_update") {
+        std::cout << "[SERVER] Received command: " << command << std::endl;
+      }
 
       // Handle the command
       msgpack::sbuffer response_buf;
 
       try {
         if (command == "get_capabilities") {
-          response_buf = handleGetCapabilities();
+          response_buf = handleGetCapabilities(server);
         } else if (command == "get_robot_state") {
           response_buf = handleGetRobotState(server);
         } else if (command == "start_stream") {
@@ -1238,6 +1822,18 @@ void RunServer(const std::string &server_address, franka::Robot *robot,
           response_buf = handleStreamJointVelocity(server, request_map);
         } else if (command == "stop_stream") {
           response_buf = handleStopStream(server);
+        } else if (command == "start_guide") {
+          response_buf = handleStartGuide(server, request_map);
+        } else if (command == "guide_update") {
+          response_buf = handleGuideUpdate(server, request_map);
+        } else if (command == "guide_resume") {
+          response_buf = handleGuideResume(server);
+        } else if (command == "stop_guide") {
+          response_buf = handleStopGuide(server);
+        } else if (command == "set_load") {
+          response_buf = handleSetLoad(server, request_map);
+        } else if (command == "recover_errors") {
+          response_buf = handleRecoverErrors(server);
         } else if (command == "execute_trajectory") {
           response_buf = handleExecuteTrajectory(server, request_map);
         } else if (command == "open_gripper") {

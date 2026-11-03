@@ -65,6 +65,19 @@ target_link_libraries(bamboo_control_node
 target_compile_options(bamboo_controllers PRIVATE -Wall -Wextra)
 target_compile_options(bamboo_control_node PRIVATE -Wall -Wextra)
 
+# Off-robot unit tests for the real-time safety math. Off by default so the
+# robot PC build needs nothing new: cmake -DBAMBOO_BUILD_TESTS=ON ..
+option(BAMBOO_BUILD_TESTS "Build off-robot unit tests (needs GTest)" OFF)
+if(BAMBOO_BUILD_TESTS)
+    enable_testing()
+    find_package(GTest REQUIRED)
+    add_executable(contact_math_test test/contact_math_test.cpp)
+    target_link_libraries(contact_math_test GTest::gtest_main Eigen3::Eigen)
+    target_compile_options(contact_math_test PRIVATE -Wall -Wextra)
+    include(GoogleTest)
+    gtest_discover_tests(contact_math_test)
+endif()
+
 # Print info
 message(STATUS "Bamboo build configuration:")
 message(STATUS "  Franka found: ${Franka_FOUND}")

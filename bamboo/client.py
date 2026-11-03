@@ -112,6 +112,7 @@ class BambooFrankaClient:
         self.control_socket = self.zmq_context.socket(zmq.REQ)
         self.control_socket.connect(f"tcp://{self.server_ip}:{self.control_port}")
         self.control_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
+        self.control_socket.setsockopt(zmq.LINGER, 0)  # never block close() on unsent requests
         _log.debug(f"Control client connected to {self.server_ip}:{self.control_port}")
 
         self.gripper_socket = None
@@ -123,6 +124,7 @@ class BambooFrankaClient:
             self.gripper_socket = self.zmq_context.socket(zmq.REQ)
             self.gripper_socket.connect(f"tcp://{self.server_ip}:{gripper_port}")
             self.gripper_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
+            self.gripper_socket.setsockopt(zmq.LINGER, 0)
             _log.debug(f"Gripper client connected to {self.server_ip}:{gripper_port}")
 
         # Test connection by trying to receive a state message
@@ -173,10 +175,12 @@ class BambooFrankaClient:
                 self.gripper_socket = self.zmq_context.socket(zmq.REQ)
                 self.gripper_socket.connect(f"tcp://{self.server_ip}:{self.gripper_port}")
                 self.gripper_socket.setsockopt(zmq.RCVTIMEO, 5000)
+                self.gripper_socket.setsockopt(zmq.LINGER, 0)
                 _log.debug(f"Gripper socket recreated at {self.server_ip}:{self.gripper_port}")
 
         self.control_socket.connect(f"tcp://{self.server_ip}:{self.control_port}")
         self.control_socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
+        self.control_socket.setsockopt(zmq.LINGER, 0)  # never block close() on unsent requests
         _log.debug(f"Control socket reconnected to {self.server_ip}:{self.control_port}")
 
     def _test_connection(self) -> None:

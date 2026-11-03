@@ -146,3 +146,26 @@ def test_contact_and_leash_state_is_read_only_when_present() -> None:
     _finish(context, server, thread)
     assert states["guide_lead"] == 0.012 and states["guide_ratchet"] is True
     assert states["contact_scale"] == 0.5 and states["contact_push"] == 24.0 and states["guard_trip"] == "hard"
+
+
+def test_close_never_waits_on_a_request_the_server_did_not_take() -> None:
+    import time
+
+    import zmq as zmq_module
+
+    from bamboo.client import BambooTimeoutError
+
+    context, server, thread, port, _ = _serve({"get_robot_state": {"success": True, "data": STATE}}, count=1)
+    client = BambooFrankaClient(server_ip="127.0.0.1", control_port=port, enable_gripper=False)
+    _finish(context, server, thread)  # the server goes away after answering once
+    assert client.control_socket.getsockopt(zmq_module.LINGER) == 0
+    try:
+        client._send_panda_hand_command({"command": "get_capabilities"}, timeout_ms=200)
+    except BambooTimeoutError:
+        pass
+    closer = threading.Thread(target=client.close)
+    started = time.monotonic()
+    closer.start()
+    closer.join(timeout=3.0)
+    assert not closer.is_alive(), "close() hung on an unsent request"
+    assert time.monotonic() - started < 1.0

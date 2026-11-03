@@ -102,9 +102,10 @@ std::string GuideStartProblem(franka::RobotMode mode) {
   case franka::RobotMode::kIdle:
     return "";
   case franka::RobotMode::kUserStopped:
-    return "Franka is user-stopped (robot mode \"User stopped\"): the user "
-           "stop button is pressed. Release it so the lights turn blue, as "
-           "for teleoperation, then start guiding again";
+    return "Franka is not in Execution mode (robot mode \"User stopped\"): "
+           "white lights mean Desk is in Programming mode, otherwise the user "
+           "stop is pressed. Switch Desk to Execution and release the user "
+           "stop, as for teleoperation, then start guiding again";
   case franka::RobotMode::kGuiding:
     return "Franka's Pilot guiding buttons are held. Let go of them, then "
            "start guiding again";

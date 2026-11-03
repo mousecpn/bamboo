@@ -207,11 +207,13 @@ beyond Desk's end effector with `set_load(mass, center_of_mass)` while no loop
 is running, and check `get_capabilities()["payload"]`. After a reflex,
 `recover_errors()` clears it without restarting the node.
 
-Like streaming, guide mode needs Franka idle: user stop released, lights blue.
-`start_guiding()` checks this and refuses with the reason (for example a pressed
-user stop), and reports success only once Franka has accepted the motion. A
-reflex left over from an earlier motion is cleared as guide mode starts.
-Pressing the user stop while guiding stops the arm and ends guide mode.
+Like streaming, guide mode needs Franka ready for FCI motions: Desk in
+Execution mode and the user stop released. White lights mean Programming mode,
+where only the Pilot's guiding buttons move the arm. `start_guiding()` checks
+this and refuses with the reason, and reports success only once Franka has
+accepted the motion. A reflex left over from an earlier motion is cleared as
+guide mode starts. Pressing the user stop while guiding stops the arm and ends
+guide mode.
 
 The external wrench and torque estimates are reported in `get_joint_states()`
 as `ext_wrench` and `tau_ext` (robot on environment) when the server supports
